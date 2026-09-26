@@ -122,6 +122,30 @@ class Storage:
             raise Error("Remote manifest has an unexpected identity or schema version.")
         return result
 
+    def artifact_index(self, rid, path):
+        """Read bounded discovery JSON through the existing metadata activity UI."""
+        from .artifacts import MAX_INDEX_BYTES
+
+        path = valid_result_path(path)
+        raw = self.call("cat", self.path(rid) + "/" + path,
+                        "--head", str(MAX_INDEX_BYTES + 1), timeout=90).stdout
+        size = len(raw.encode("utf-8")) if isinstance(raw, str) else len(raw)
+        if size > MAX_INDEX_BYTES:
+            raise Error("EWS artifact catalog exceeds the 64 KiB limit; use --path.")
+
+        def unique_keys(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("duplicate key")
+                result[key] = value
+            return result
+
+        try:
+            return json.loads(raw, object_pairs_hook=unique_keys)
+        except (ValueError, UnicodeError, RecursionError):
+            raise Error("Invalid EWS artifact JSON; use --path to inspect stored files.") from None
+
     def manifests(self):
         entries = json.loads(self.call("lsjson", self.path(), "--dirs-only", timeout=120).stdout)
         manifests, skipped = [], 0

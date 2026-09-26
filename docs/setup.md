@@ -305,7 +305,7 @@ cloud-results ls RUN_ID
 cloud-results pull RUN_ID --plots
 # Or fetch saved analysis / a specific report:
 cloud-results pull RUN_ID --analysis
-cloud-results pull RUN_ID --path artifacts/output/compute/summary.md
+cloud-results pull RUN_ID --report
 # For the complete archival bundle:
 cloud-results pull RUN_ID
 # or incrementally retrieve all runs:
@@ -315,7 +315,9 @@ cloud-results sync
 For a custom destination, `cloud-results pull RUN_ID --dest /path/to/run-results`.
 Selectors also accept `--dest`: it is the run root, with the remote-relative
 subtree preserved below it. `ls` reads names/sizes only; `--plots` succeeds with
-an explanation when an existing run has no figures. Plain `pull` and `sync`
+an explanation when the EWS catalog declares optional figures but none are
+stored. Semantic selectors read the EWS `artifacts.json` catalog. Legacy runs
+without it require `ls` followed by `--path RELATIVE_PATH`. Plain `pull` and `sync`
 download full runs; no analysis code is executed automatically. See the
 [README's remote inspection and selective download reference](../README.md#inspect-remote-results-and-download-selected-files)
 for exact paths, output formats, and validation rules. Check the current checkout

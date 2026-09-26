@@ -35,8 +35,9 @@ project, `nbg1`, and `migwings-experiments` bucket described there.
 | `cloud-results list` | Read remote manifests, including failed and incomplete runs. |
 | `cloud-results ls RUN_ID [--json]` | Recursively list remote file paths and sizes without downloading contents. |
 | `cloud-results pull RUN_ID [--dest PATH]` | Download the full run, by default to `~/cloud-results/RUN_ID`. |
-| `cloud-results pull RUN_ID --plots` | Download only `artifacts/output/analysis/figures/`; succeed with an explanation if absent. |
-| `cloud-results pull RUN_ID --analysis` | Download `artifacts/output/analysis/`, including figures; does not execute analysis. |
+| `cloud-results pull RUN_ID --plots` | Resolve the EWS `figures` role; succeed with an explanation if optional files are absent. |
+| `cloud-results pull RUN_ID --analysis` | Resolve the EWS `analysis` role; does not execute analysis. |
+| `cloud-results pull RUN_ID --report` | Resolve the EWS `compute_report` role. |
 | `cloud-results pull RUN_ID --path RELATIVE_PATH` | Download one literal file or subtree, preserving its run-relative path. |
 | `cloud-results sync` | Retrieve new/changed full runs; skip final manifests already fully downloaded. |
 | `cloud-cancel RUN_ID [--yes]` | Ask the worker to stop, upload partial results, and delete itself. |
@@ -253,15 +254,38 @@ For a quick look at plots or analysis, download just the relevant subtree:
 ```bash
 cloud-results pull RUN_ID --plots
 cloud-results pull RUN_ID --analysis
-cloud-results pull RUN_ID --path artifacts/output/compute/summary.md
+cloud-results pull RUN_ID --report
 cloud-results pull RUN_ID --path logs
 cloud-results pull RUN_ID --path manifest.json
 ```
 
-`--plots` selects `artifacts/output/analysis/figures/`; `--analysis` selects
-`artifacts/output/analysis/`, including figures and any other saved analysis
-exports. These are the default EWS output locations. For a custom output layout,
-use `ls` followed by `--path`. Selectors are mutually exclusive. `--path` matches
+`--plots`, `--analysis`, and `--report` resolve the EWS semantic roles `figures`,
+`analysis`, and `compute_report`. They discover the single `artifacts.json` under
+captured `artifacts/` (including custom output roots), read its schema/version,
+and resolve paths relative to its parent. EWS owns these paths; cloud-experiments
+has no mapping of EWS internal figure/analysis/report locations. The small
+catalog is fetched in addition to the file listing; unrelated result contents
+are not downloaded. `ls` itself remains names/sizes only.
+
+The supported [EWS contract](https://github.com/m1gwings/experiments-wo-stress/blob/main/docs/ARTIFACTS.md)
+is `schema: "experiments-wo-stress/artifacts"`, integer `schema_version: 1`, and
+`artifacts: {role: {path, kind, optional}}`. Each path is a canonical relative
+POSIX path; `kind` is `file` or `directory`, and `optional` is boolean. File roles
+select exactly one object; directory roles select descendants. Unknown roles
+and extra fields are allowed. Catalogs have a 64 KiB cap; malformed/unsafe JSON,
+duplicate keys, unsupported versions, and ambiguous multiple catalogs fail with
+a clear explanation. Missing optional files or unpublished roles succeed with
+an explanation and no download. A missing required artifact fails.
+
+**Legacy uploads without a catalog require `--path`.** Use `cloud-results ls
+RUN_ID` to choose the literal stored file/subtree. No legacy layout is silently
+assumed. Use `--path` for ambiguous multiple EWS outputs or arbitrary artifacts
+as well. A newer EWS checkout cannot retrofit an already uploaded legacy run.
+Full pulls and listing work independently of EWS metadata. Support is detected
+per run, never from a globally required EWS Git SHA; the cloud run manifest still
+records the exact EWS commit for provenance and reproduction.
+
+Selectors are mutually exclusive. `--path` matches
 one exact file or a directory and all descendants, not a glob or a partial name.
 Quote paths containing spaces or shell metacharacters. One trailing `/` is
 accepted; absolute paths, `.`/`..` components, repeated `/`, backslashes, colons,
@@ -269,11 +293,13 @@ and control characters are rejected before storage access. Stored paths are
 validated too; the local full-download marker cannot be selected or overwritten.
 Existing symlinks within a selected local subtree are rejected.
 
-All selectors preserve the remote-relative tree inside the local run root:
+All selectors preserve the remote-relative tree inside the local run root. For
+example, with the current default EWS layout (these are examples, not mappings):
 
 ```text
 --plots                         -> ~/cloud-results/RUN_ID/artifacts/output/analysis/figures/
 --analysis                      -> ~/cloud-results/RUN_ID/artifacts/output/analysis/
+--report                        -> ~/cloud-results/RUN_ID/artifacts/output/compute/summary.md
 --path logs                     -> ~/cloud-results/RUN_ID/logs/
 --path manifest.json            -> ~/cloud-results/RUN_ID/manifest.json
 ```
@@ -283,16 +309,17 @@ local **run root**, including for selective pulls:
 
 ```bash
 cloud-results pull RUN_ID --plots --dest /path/to/run-results
-# Figures land in /path/to/run-results/artifacts/output/analysis/figures/
+# The manifest-selected figure path is preserved below /path/to/run-results/
 ```
 
 A successful selective pull prints the selected local file/directory path on
 stdout and a completion message on stderr. It lists metadata first, copies only
 matching objects, and uses the same interactive progress/plain output as a full
 pull. Repeating it copies new/changed files without deleting local extras. If an
-existing run has no figures, `--plots` exits successfully, explains that nothing
-was downloaded, and prints no destination. Missing generic paths/analysis,
-unknown or empty runs, and storage errors fail clearly. A selector does not run
+catalog declares optional figures but no figure objects are stored, `--plots`
+exits successfully, explains that nothing was downloaded, and prints no
+destination. The same rule applies to other optional roles. Missing generic
+paths, required artifacts, unknown/empty runs, and storage errors fail clearly. A selector does not run
 analysis or create figures; a run without configured/generated/uploaded figures
 will still have none after a pull.
 

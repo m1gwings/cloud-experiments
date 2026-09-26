@@ -13,6 +13,7 @@ import tempfile
 import time
 
 from . import __version__
+from .artifacts import artifact_selection
 from .bootstrap import render
 from .common import Error, FINAL, SHA_RE, read_json, run_id, sha256, utcnow, valid_result_path, valid_run, write_json
 from .config import DEPENDENCIES, load, repository_url, run_settings, runtime_hours, storage_credentials, worker_secrets
@@ -278,17 +279,28 @@ def pull_run(storage, config, rid, destination=None):
     print(destination)
 
 
-def pull_selection(storage, config, rid, selection, destination=None, *, plots=False):
-    rid, selection = valid_run(rid), valid_result_path(selection)
+def pull_selection(storage, config, rid, selection=None, destination=None, *, role=None):
+    rid = valid_run(rid)
+    if role is None:
+        selection = valid_result_path(selection)
     files = storage.files(rid)
     if not files:
         raise Error("No stored files found for this run; check the run ID and storage configuration.")
+    kind, optional = None, False
+    if role is not None:
+        entry = artifact_selection(storage, rid, files, role)
+        if entry is None:
+            print(f"This run publishes no {role} role; nothing downloaded. "
+                  "Use cloud-results ls RUN_ID and --path to inspect other files.", file=sys.stderr)
+            return
+        selection, kind, optional = entry["path"], entry["kind"], entry["optional"]
     paths = [entry["path"] for entry in files
-             if entry["path"] == selection or entry["path"].startswith(selection + "/")]
+             if (kind != "directory" and entry["path"] == selection)
+             or (kind != "file" and entry["path"].startswith(selection + "/"))]
     if not paths:
-        if plots:
-            print("No figures found under artifacts/output/analysis/figures/; nothing downloaded. "
-                  "This run may not have generated or uploaded figures.", file=sys.stderr)
+        if optional:
+            print(f"This run has no stored {role} files; nothing downloaded. "
+                  "The optional artifact may not have been generated or uploaded.", file=sys.stderr)
             return
         raise Error("The selected path has no stored files; use cloud-results ls RUN_ID to inspect the run.")
     destination = Path(destination).expanduser().absolute() if destination else Path(config["local"]["results_dir"]) / rid
@@ -318,13 +330,9 @@ def results(args, config):
         if not files:
             print("No stored files found for this run; check the run ID and storage configuration.", file=sys.stderr)
     elif args.operation == "pull":
-        selection = args.path
-        if args.plots:
-            selection = "artifacts/output/analysis/figures"
-        elif args.analysis:
-            selection = "artifacts/output/analysis"
-        if selection is not None:
-            pull_selection(storage, config, args.run_id, selection, args.dest, plots=args.plots)
+        role = "figures" if args.plots else "analysis" if args.analysis else "compute_report" if args.report else None
+        if args.path is not None or role is not None:
+            pull_selection(storage, config, args.run_id, args.path, args.dest, role=role)
         else:
             pull_run(storage, config, args.run_id, args.dest)
     else:
@@ -373,7 +381,7 @@ def parser(name):
     elif name == "cloud-results":
         p.description = "Browse stored runs and download full archives or selected results."
         p.epilog = ("Examples: cloud-results ls RUN_ID; cloud-results pull RUN_ID --plots; "
-                    "cloud-results pull RUN_ID --analysis; cloud-results pull RUN_ID --path RELATIVE_PATH. "
+                    "cloud-results pull RUN_ID --analysis; cloud-results pull RUN_ID --report; cloud-results pull RUN_ID --path RELATIVE_PATH. "
                     "Use pull --help for download options.")
         sub = p.add_subparsers(dest="operation", required=True)
         sub.add_parser("list", help="List remote run manifests")
@@ -381,13 +389,14 @@ def parser(name):
                                  description="List all files recursively. Redirected stdout is headerless BYTES<TAB>PATH; activity uses stderr.")
         listing.add_argument("run_id")
         listing.add_argument("--json", action="store_true", help="Output a JSON array of {path, size} records; size is bytes")
-        pull = sub.add_parser("pull", help="Download a full run or select --plots, --analysis or --path",
-                              description="Download a full run by default. Selectors preserve run-relative paths and never mark a run fully downloaded.")
+        pull = sub.add_parser("pull", help="Download a full run or select --plots, --analysis, --report or --path",
+                              description="Download a full run by default. Semantic selectors read EWS artifacts.json; legacy runs require --path. Selectors preserve run-relative paths and never mark a run fully downloaded.")
         pull.add_argument("run_id")
         pull.add_argument("--dest", metavar="PATH", help="Local run root (default: configured results_dir/RUN_ID); also applies to selectors")
         selectors = pull.add_mutually_exclusive_group()
-        selectors.add_argument("--plots", action="store_true", help="Fetch artifacts/output/analysis/figures/; succeed without downloading if absent")
-        selectors.add_argument("--analysis", action="store_true", help="Fetch artifacts/output/analysis/ (does not execute analysis)")
+        selectors.add_argument("--plots", action="store_true", help="Fetch the figures role from EWS artifacts.json; optional missing figures succeed")
+        selectors.add_argument("--analysis", action="store_true", help="Fetch the analysis role from EWS artifacts.json (does not execute analysis)")
+        selectors.add_argument("--report", action="store_true", help="Fetch the compute_report role from EWS artifacts.json")
         selectors.add_argument("--path", metavar="RELATIVE_PATH", help="Fetch one literal file or subtree inside the run, preserving its relative path")
         sub.add_parser("sync", help="Download new/changed full runs; skip unchanged final archives")
     return p

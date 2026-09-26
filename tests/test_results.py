@@ -12,17 +12,29 @@ from unittest.mock import Mock, patch
 
 from test_core import sample_config, sample_manifest
 from cloud_experiments import cli
+from cloud_experiments.artifacts import MAX_INDEX_BYTES
 from cloud_experiments.common import Error, read_json, write_json
 from cloud_experiments.providers import Storage
 
-FIGURES = "artifacts/output/analysis/figures"
+OUTPUT = "artifacts/custom/study"
+FIGURES = OUTPUT + "/exports/charts"
+INDEX_PATH = OUTPUT + "/artifacts.json"
+INDEX = {
+    "schema": "experiments-wo-stress/artifacts", "schema_version": 1,
+    "artifacts": {
+        "figures": {"path": "exports/charts", "kind": "directory", "optional": True},
+        "analysis": {"path": "exports", "kind": "directory", "optional": True},
+        "compute_report": {"path": "resources.md", "kind": "file", "optional": True},
+    },
+}
 FILES = [
     {"path": FIGURES + "/regret.pdf", "size": 2048},
     {"path": FIGURES + "/nested/plot.jpg", "size": 512},
     {"path": FIGURES + "-old/other.pdf", "size": 99},
-    {"path": "artifacts/output/analysis/summary.csv", "size": 20},
-    {"path": "artifacts/output/compute/summary.md", "size": 30},
+    {"path": OUTPUT + "/exports/summary.csv", "size": 20},
+    {"path": OUTPUT + "/resources.md", "size": 30},
     {"path": "manifest.json", "size": 100},
+    {"path": INDEX_PATH, "size": len(json.dumps(INDEX))},
 ]
 
 
@@ -35,6 +47,7 @@ class ResultTests(unittest.TestCase):
         self.destination = Path(self.config["local"]["results_dir"]) / "test-run"
         self.storage = Mock()
         self.storage.files.return_value = FILES
+        self.storage.artifact_index.return_value = json.loads(json.dumps(INDEX))
         self.out, self.err = io.StringIO(), io.StringIO()
         self.stack = contextlib.ExitStack()
         self.addCleanup(self.stack.close)
@@ -57,6 +70,8 @@ class ResultTests(unittest.TestCase):
         for args in (("pull", "test-run", "--plots", "--analysis"),
                      ("pull", "test-run", "--plots", "--path", "manifest.json"),
                      ("pull", "test-run", "--analysis", "--path", "manifest.json"),
+                     ("pull", "test-run", "--report", "--plots"),
+                     ("pull", "test-run", "--report", "--path", "logs"),
                      ("sync", "--plots"), ("sync", "--path", "manifest.json")):
             with self.subTest(args=args), self.assertRaises(SystemExit):
                 self.run_results(*args)
@@ -90,6 +105,63 @@ class ResultTests(unittest.TestCase):
         self.run_results("pull", "test-run", "--analysis")
         self.assertEqual(self.storage.pull_paths.call_args.args[2], [x["path"] for x in FILES[:4]])
 
+    def test_report_selects_only_the_file_and_not_descendants(self):
+        self.storage.files.return_value = FILES + [{"path": OUTPUT + "/resources.md/extra", "size": 1}]
+        self.run_results("pull", "test-run", "--report")
+        self.storage.artifact_index.assert_called_once_with("test-run", INDEX_PATH)
+        self.assertEqual(self.storage.pull_paths.call_args.args[2], [OUTPUT + "/resources.md"])
+
+    def test_optional_absent_analysis_report_and_undeclared_role_succeed(self):
+        self.storage.files.return_value = [FILES[-1]]
+        for selector in ("--analysis", "--report", "--plots"):
+            self.run_results("pull", "test-run", selector)
+        self.storage.artifact_index.return_value["artifacts"].pop("figures")
+        self.run_results("pull", "test-run", "--plots")
+        self.assertIn("publishes no figures role", self.err.getvalue())
+        self.storage.pull_paths.assert_not_called()
+        self.assertFalse(self.destination.exists())
+
+    def test_legacy_runs_require_path_and_generic_paths_do_not_read_ews_metadata(self):
+        self.storage.files.return_value = FILES[:-1]
+        with self.assertRaisesRegex(Error, "legacy run.*metadata not uploaded"):
+            self.run_results("pull", "test-run", "--plots")
+        self.run_results("pull", "test-run", "--path", FIGURES)
+        self.storage.artifact_index.assert_not_called()
+        self.assertEqual(self.storage.pull_paths.call_args.args[2], [x["path"] for x in FILES[:2]])
+
+    def test_multiple_catalogs_and_oversized_metadata_fail_without_downloading(self):
+        for files in (FILES + [{"path": "artifacts/second/artifacts.json", "size": 1}],
+                      [{"path": INDEX_PATH, "size": MAX_INDEX_BYTES + 1}]):
+            self.storage.files.return_value = files
+            with self.assertRaises(Error):
+                self.run_results("pull", "test-run", "--plots")
+        self.storage.artifact_index.assert_not_called()
+        self.storage.pull_paths.assert_not_called()
+
+    def test_invalid_schema_and_descriptors_never_fall_back_to_layout_guesses(self):
+        indexes = [[], {}, {**INDEX, "schema_version": 2}, {**INDEX, "schema_version": True},
+                   {**INDEX, "schema": "another-format"}, {**INDEX, "artifacts": []}]
+        for path in ("../outside", "/absolute", "a/../b", "a//b", "a/", "C:/tmp", "a\\b", "a\nb", None):
+            indexes.append({**INDEX, "artifacts": {"figures": {"path": path, "kind": "directory", "optional": True}}})
+        for entry in ({"path": "ok", "kind": "glob", "optional": True},
+                      {"path": "ok", "kind": "file"}, {"path": "ok", "kind": "file", "optional": "true"}):
+            indexes.append({**INDEX, "artifacts": {"figures": entry}})
+        for index in indexes:
+            with self.subTest(index=index), self.assertRaises(Error):
+                self.storage.artifact_index.return_value = index
+                self.run_results("pull", "test-run", "--plots")
+        self.storage.pull_paths.assert_not_called()
+
+    def test_missing_required_artifact_and_catalog_read_failure_are_errors(self):
+        self.storage.files.return_value = [FILES[-1]]
+        self.storage.artifact_index.return_value["artifacts"]["figures"]["optional"] = False
+        with self.assertRaisesRegex(Error, "selected path"):
+            self.run_results("pull", "test-run", "--plots")
+        self.storage.artifact_index.side_effect = Error("catalog read failed")
+        with self.assertRaisesRegex(Error, "catalog read failed"):
+            self.run_results("pull", "test-run", "--plots")
+        self.storage.pull_paths.assert_not_called()
+
     def test_file_and_trailing_slash_subtree_with_custom_run_root(self):
         for path, expected in (("manifest.json", ["manifest.json"]), (FIGURES + "/", [x["path"] for x in FILES[:2]])):
             with self.subTest(path=path):
@@ -110,7 +182,7 @@ class ResultTests(unittest.TestCase):
         self.storage.files.return_value = FILES[2:]
         self.run_results("pull", "test-run", "--plots")
         self.storage.pull_paths.assert_not_called()
-        self.assertIn("No figures found", self.err.getvalue())
+        self.assertIn("no stored figures", self.err.getvalue())
         self.assertEqual(self.out.getvalue(), "")
         self.assertFalse(self.destination.exists())
 
@@ -191,6 +263,17 @@ class ResultTests(unittest.TestCase):
 
 
 class StorageResultTests(unittest.TestCase):
+    def test_catalog_reads_are_bounded_and_reject_malformed_duplicate_or_oversized_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            storage = Storage(sample_config(tmp))
+            with patch.object(storage, "call", return_value=Mock(stdout=json.dumps(INDEX))) as call:
+                self.assertEqual(storage.artifact_index("test-run", INDEX_PATH), INDEX)
+                call.assert_called_once_with("cat", storage.path("test-run") + "/" + INDEX_PATH,
+                                             "--head", str(MAX_INDEX_BYTES + 1), timeout=90)
+            for raw in ('{', '{"schema_version": 1, "schema_version": 2}', b'\xff', ' ' * (MAX_INDEX_BYTES + 1)):
+                with self.subTest(raw=str(raw)[:40]), patch.object(storage, "call", return_value=Mock(stdout=raw)), self.assertRaises(Error):
+                    storage.artifact_index("test-run", INDEX_PATH)
+
     def test_listing_is_metadata_only_sorted_and_confined_to_run(self):
         with tempfile.TemporaryDirectory() as tmp:
             storage = Storage(sample_config(tmp))
@@ -255,6 +338,7 @@ class StorageResultTests(unittest.TestCase):
             Path(config["local"]["rclone_config"]).write_text("")
             source, destination = root / "remote-run", root / "download"
             contents = {x["path"]: "test " + x["path"] for x in FILES}
+            contents[INDEX_PATH] = json.dumps(INDEX)
             contents[FIGURES + "/# [x]*?.pdf"] = "literal filename"
             contents[FIGURES + "/ spaced name "] = "spaces retained"
             contents[FIGURES + "/unicode-λ.pdf"] = "unicode name"
@@ -264,7 +348,7 @@ class StorageResultTests(unittest.TestCase):
                 target.write_text(value)
             storage = Storage(config)
             with patch.object(storage, "path", return_value=str(source)):
-                cli.pull_selection(storage, config, "test-run", FIGURES, destination, plots=True)
+                cli.pull_selection(storage, config, "test-run", destination=destination, role="figures")
                 actual = {str(p.relative_to(destination)) for p in destination.rglob("*") if p.is_file()}
                 self.assertEqual(actual, {p for p in contents if p.startswith(FIGURES + "/")})
                 self.assertFalse((destination / ".cloud-pulled.json").exists())
@@ -272,7 +356,7 @@ class StorageResultTests(unittest.TestCase):
                 self.assertEqual((destination / "manifest.json").read_text(), contents["manifest.json"])
                 # A repeat is incremental; preserve local extras and all source bytes.
                 (destination / "keep-local.txt").write_text("keep")
-                cli.pull_selection(storage, config, "test-run", FIGURES, destination, plots=True)
+                cli.pull_selection(storage, config, "test-run", destination=destination, role="figures")
                 self.assertEqual((destination / "keep-local.txt").read_text(), "keep")
                 self.assertEqual({str(p.relative_to(source)): p.read_text() for p in source.rglob("*") if p.is_file()}, contents)
 

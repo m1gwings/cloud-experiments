@@ -10,12 +10,13 @@ shared package in `lib/cloud_experiments` has no third-party Python dependencies
 | `common.py` | Safe subprocess wrapper, IDs, atomic JSON, hashing, label checks. |
 | `progress.py` | Nested stderr activities, TTY detection, periodic updates, numeric transfer statistics. |
 | `source.py` | Git inspection, exact snapshots, safe extraction, file inventories. |
+| `artifacts.py` | Discover and validate EWS semantic catalogs; resolve role paths without internal layout mappings. |
 | `providers.py` | Structured hcloud/rclone arguments; quoted SSH; remote manifests. |
 | `bootstrap.py` | Compressed Python bundle and systemd units in cloud-init JSON/YAML. |
 | `worker.py` | Installation, PTY execution, supervision, finalization, direct API deletion. |
 
 The laptop makes no assumptions about EWS internals. The default argument
-array and optional webhook environment name are EWS-specific. Paper-specific algorithms, instance generators, and
+array, optional webhook environment name, and versioned artifact catalog contract are EWS-specific. Paper-specific algorithms, instance generators, and
 configuration belong in experiment repositories.
 
 ## Lifetime and ownership
@@ -123,12 +124,30 @@ retained; file bodies and hashes are not fetched. The default redirected output
 is headerless TSV, and `--json` provides structured records. Paths are validated
 before rendering to keep controls/traversal out of terminal output and downloads.
 
-Selective pulls match an exact path or its `/`-delimited descendants against
+Semantic pulls discover a unique `artifacts.json` under captured `artifacts/`
+using the listing. Its parent is the EWS output root, even for a custom command.
+The catalog discriminator is `experiments-wo-stress/artifacts`, version 1;
+`figures`, `analysis`, and `compute_report` map to CLI selectors. Bounded metadata
+reads use the existing activity adapter; both the advertised size and actual read
+are capped at 64 KiB. JSON duplicate keys, unknown schema versions, invalid kinds,
+non-boolean optional flags, and noncanonical/escaping paths are rejected before
+copying. Unknown roles/fields can be added without a version change. EWS owns
+layout and path updates, while the cloud run manifest retains the exact EWS commit.
+No global Git SHA or EWS package version gates retrieval.
+
+Missing catalogs (including legacy runs), unsupported formats, or multiple
+catalogs require `ls` and explicit `--path`; there is no hardcoded fallback.
+Unpublished roles and optional roles without stored objects succeed with an
+explanation. Required roles without stored objects fail. Presence is determined
+from stored objects, not cached booleans. Neither discovery nor retrieval
+executes experiment code or writes remote data.
+
+Generic selective pulls match an exact path or its `/`-delimited descendants against
 that listing. A private temporary `--files-from-raw` list drives `rclone copy`
 from the run root to the local run root; paths are literal, never filter globs.
 Destination symlinks and the reserved full-download marker are rejected before
-copying. Missing figures are a successful no-op only after an existing run's
-listing succeeds; missing generic paths and provider failures remain errors.
+copying. Semantic file roles match only the exact object; directory roles match
+only descendants. Missing generic paths and provider failures remain errors.
 Selective copies share the transfer progress adapter and never create/refresh
 `.cloud-pulled.json`. Full pulls still write that marker after success, and
 `sync` still downloads whole runs. No result command deletes remote objects.
