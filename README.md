@@ -85,6 +85,7 @@ The default command is based on the EWS checkout's documented CLI:
 command = ["ews", "run", "{config}", "--output", "{output}"]
 install_experiment = "auto"  # or "never"
 artifact_exclude = []
+ews_discord = false         # optional EWS progress messages; see below
 ```
 
 This is an argument array, not a shell snippet. `{config}` is the config's
@@ -103,6 +104,47 @@ runs as `experiment`; credentials and finalization run as root. The real command
 has a PTY inside the named `experiment` tmux session, preserving EWS's live
 dashboard. systemd supervises the worker and bounds its lifetime independently
 of tmux and the laptop connection.
+
+## Discord: configure once, reuse across studies
+
+The optional `DISCORD_WEBHOOK_URL` in `~/.config/cloud-experiments/worker.env`
+sends cloud startup and final lifecycle messages. To also receive EWS progress,
+add this setting once to the existing `[run]` table in
+`~/.config/cloud-experiments/config.toml` (create that table if absent):
+
+```toml
+[run]
+ews_discord = true
+```
+
+Keep the URL only in the private `worker.env`, alongside the existing worker
+token. See [setup](docs/setup.md#6-create-a-dedicated-worker-token) for the file
+format and permissions. No per-run export or URL in the experiment repo is
+needed. Each EWS study must enable `notifications.discord` and use
+`webhook_env: EWS_DISCORD_WEBHOOK_URL`; its YAML controls the message interval.
+Cloud forwarding does not rewrite the YAML or enable EWS notifications itself.
+Both channels can use the same Discord webhook.
+
+`run.ews_discord` defaults to `false`. With it enabled, a missing webhook fails
+before any input upload or VM creation. Launch validates presence and URL syntax;
+it does not contact Discord to test whether the webhook is still valid.
+Delivery failures remain best effort: they must not stop simulations or cleanup.
+`cloud-doctor` continues to check only non-secret configuration and executables.
+
+The worker uses systemd `LoadCredential` to give only the experiment service a
+protected runtime copy of the webhook, outside `/work`. The execution wrapper
+sets `EWS_DISCORD_WEBHOOK_URL` in the research process environment; the URL is
+absent from command arguments, unit text, manifests, and automatic artifact
+collection. Hetzner/S3 credentials remain root-only. The experiment can read its
+webhook when this option is on: do not dump the environment or write credentials
+to output files. Dependency installation does not receive the webhook.
+
+The non-secret forwarding choice is stored in each run's settings. Reproduction
+retains that choice and reads the current laptop's webhook, so rotation needs
+one edit to `worker.env` for future workers. Existing VMs keep the credential
+they received at launch. Older manifests without this setting reproduce with
+forwarding disabled. EWS summaries cover execution; cloud final messages also
+report upload outcomes and precede the deletion request, not confirmed deletion.
 
 ## Results and provenance
 
@@ -190,8 +232,9 @@ is deleted. Anyone with project administrative access can access a worker;
 project-scoped API tokens are not per-server least-privilege tokens. Use a
 dedicated research project and narrowly scoped storage credentials where possible.
 
-The experiment does not receive these credentials and cannot read cloud-init
-state. Trusted research code and dependency installers are assumed; this is not
+The experiment never receives Hetzner/S3 credentials and cannot read cloud-init
+state. With `run.ews_discord = true`, only the Discord webhook is shared through
+the runtime credential described above. Trusted research code and dependency installers are assumed; this is not
 a security sandbox for hostile code. Never put secrets in source/configs or print
 them from experiments. Filename protections and redaction are defense in depth,
 not secret discovery. SSH uses trust-on-first-use with separate known-host files

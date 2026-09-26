@@ -294,12 +294,23 @@ class Worker:
 
 
 def execute(work=WORK):
-    """Runs inside tmux as experiment, with no access to root credentials."""
+    """Runs in tmux; only an explicitly supplied Discord credential reaches EWS."""
     work = Path(work)
     argv = read_json(work / "runtime/command.json")
     env = {"HOME": str(work / "home"), "PATH": str(work / ".venv/bin") + ":/usr/local/bin:/usr/bin:/bin",
            "TERM": "screen-256color", "LANG": "C.UTF-8", "PYTHONPATH": str(work / "source"),
            "CLOUD_EXPERIMENTS_OUTPUT": str(work / "output"), "TMPDIR": str(work / "home")}
+    credentials = os.environ.get("CREDENTIALS_DIRECTORY")
+    if credentials:
+        # systemd creates a protected, service-scoped copy with LoadCredential.
+        # Do not inherit the caller's environment or pass secrets in argv.
+        try:
+            webhook = (Path(credentials) / "ews-discord-webhook").read_text()
+            if not webhook or any(c in webhook for c in "\n\r\x00"):
+                raise ValueError("invalid credential")
+        except (OSError, ValueError):
+            raise Error("EWS Discord runtime credential is missing or invalid; value withheld.") from None
+        env["EWS_DISCORD_WEBHOOK_URL"] = webhook
     # script supplies the experiment with a real PTY for EWS's dashboard and logs it.
     result = subprocess.run(["script", "--quiet", "--return", "--flush", "--command", shlex.join(argv),
                              str(work / "runtime/console.log")], cwd=work / "source", env=env)

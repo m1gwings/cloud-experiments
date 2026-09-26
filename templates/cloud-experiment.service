@@ -6,6 +6,7 @@ Type=forking
 User=experiment
 Group=experiment
 Environment=HOME=/work/home
+@EWS_DISCORD_CREDENTIAL@
 WorkingDirectory=/work/source
 ExecStart=/usr/bin/tmux -L cloud-experiments new-session -d -s experiment "@ENTRY@ execute"
 TimeoutStopSec=20
@@ -18,3 +19,4 @@ ProtectHome=yes
 PrivateDevices=yes
 RestrictSUIDSGID=yes
 InaccessiblePaths=/opt/cloud-experiments/credentials.json /opt/cloud-experiments/rclone.conf /var/lib/cloud
+InaccessiblePaths=-/opt/cloud-experiments/ews-discord-webhook

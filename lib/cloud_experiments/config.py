@@ -49,9 +49,10 @@ def repository_url(value, public=False):
 
 
 def run_settings(settings):
-    result = {"command": DEFAULT_COMMAND, "install_experiment": "auto", "artifact_exclude": []}
+    result = {"command": DEFAULT_COMMAND, "install_experiment": "auto", "artifact_exclude": [],
+              "ews_discord": False}
     result.update(settings)
-    if set(result) - {"command", "install_experiment", "artifact_exclude"}:
+    if set(result) - {"command", "install_experiment", "artifact_exclude", "ews_discord"}:
         raise Error("Unknown [run] setting.")
     if (not isinstance(result["command"], list) or not result["command"]
             or not all(isinstance(x, str) and x and "\x00" not in x for x in result["command"])):
@@ -60,8 +61,20 @@ def run_settings(settings):
         raise Error("run.install_experiment must be 'auto' or 'never'.")
     if not isinstance(result["artifact_exclude"], list) or not all(isinstance(x, str) for x in result["artifact_exclude"]):
         raise Error("run.artifact_exclude must be an array of relative glob patterns.")
+    if not isinstance(result["ews_discord"], bool):
+        raise Error("run.ews_discord must be a boolean.")
     # Only literal replacement of these placeholders; no shell or format evaluation.
     return result
+
+
+def ews_discord_webhook(settings, secrets):
+    """Select only the explicitly enabled webhook; never expose provider credentials."""
+    if not settings.get("ews_discord", False):
+        return None
+    url = secrets.get("DISCORD_WEBHOOK_URL")
+    if not url:
+        raise Error("run.ews_discord requires DISCORD_WEBHOOK_URL in worker.env before launch.")
+    return url
 
 
 def load(path=None):

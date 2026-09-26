@@ -19,6 +19,7 @@ default_ref = "main"
 command = ["ews", "run", "{config}", "--output", "{output}"]
 install_experiment = "auto" # requirements.txt, then editable project if present
 artifact_exclude = [] # globs relative to /work; recorded in every manifest
+ews_discord = false # set true once to forward worker.env's Discord webhook to EWS
 
 # All paths support ~. XDG_CONFIG_HOME and XDG_STATE_HOME are honored by defaults.
 # [local]

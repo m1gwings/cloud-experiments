@@ -13,8 +13,8 @@ shared package in `lib/cloud_experiments` has no third-party Python dependencies
 | `bootstrap.py` | Compressed Python bundle and systemd units in cloud-init JSON/YAML. |
 | `worker.py` | Installation, PTY execution, supervision, finalization, direct API deletion. |
 
-The laptop makes no assumptions about EWS internals. Only the default argument
-array is EWS-specific. Paper-specific algorithms, instance generators, and
+The laptop makes no assumptions about EWS internals. The default argument
+array and optional webhook environment name are EWS-specific. Paper-specific algorithms, instance generators, and
 configuration belong in experiment repositories.
 
 ## Lifetime and ownership
@@ -35,6 +35,12 @@ configuration belong in experiment repositories.
    `script` gives the command a PTY and captures stdout/stderr together. A file
    records the command exit code; the root supervisor watches it and the service.
    Losing tmux is detected as a failure even if the exit record is absent.
+   When `run.ews_discord` is enabled, systemd loads only the Discord webhook
+   into this service's protected credential directory. The wrapper reads it
+   through `CREDENTIALS_DIRECTORY` and constructs the EWS environment explicitly;
+   it never copies the parent environment or passes the URL in argv. The source
+   credential is root-owned mode 600 outside `/work`, and the original provider
+   credential paths remain inaccessible to the experiment service.
 6. Completion, failure, cancellation, or a deadline starts a separate root
    finalizer. It stops setup and experiment cgroups, collects workspace deltas,
    writes metadata, copies/checks payloads, then publishes/verifies the manifest.
@@ -62,6 +68,7 @@ transition to timeout or cancellation at a later request.
 | Failure | Response |
 | --- | --- |
 | Bad input / dirty tree / failed EWS fetch / failed preflight upload | No VM created. |
+| Forwarding enabled but webhook missing | Reject before storage mutation or VM creation, including reproductions. |
 | Creation response lost | Discover only exact matching managed labels/name; request cleanup. |
 | SSH/upload/setup failure | Worker finalization, or checked laptop deletion if unreachable. |
 | Laptop dies before/during setup | First-boot timers remain responsible for eventual deletion. |
@@ -97,6 +104,15 @@ Full dependency/environment bit-for-bit reproducibility is outside this first
 version: Ubuntu image packages and unpinned pip dependencies may change. Git
 source, config bytes, and EWS commit are fixed; environment details and pip freeze
 are recorded. User lockfiles can tighten this boundary.
+
+`run.ews_discord` is a boolean in the saved run settings, defaulting to false
+for legacy manifests. Reproduction preserves the original setting but supplies
+the current laptop webhook. Cloud lifecycle notifications remain independent.
+The root webhook file and systemd runtime copy are outside artifact inputs, and
+the known credential filename is excluded if accidentally copied into `/work`.
+As with other trusted experiment code, arbitrary environment dumps or encoded
+copies of secrets must not be written to scientific artifacts. The forwarding
+option grants the research process webhook access, not Hetzner/S3 access.
 
 ## Verification
 

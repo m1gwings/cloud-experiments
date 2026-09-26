@@ -139,6 +139,18 @@ chmod 700 ~/.config/cloud-experiments
 chmod 600 ~/.config/cloud-experiments/worker.env
 ```
 
+For Discord notifications, add your actual webhook as `DISCORD_WEBHOOK_URL` in
+this same private file, keeping the existing `HCLOUD_WORKER_TOKEN` line. You
+configure it once for all experiment repositories using this cloud setup. Do
+not put it in the experiment YAML, `config.toml`, a shell command argument, or
+Git. The cloud lifecycle notifier uses it automatically when present.
+
+For EWS progress messages too, enable forwarding once in the non-secret cloud
+configuration (section 7), and enable notifications in the experiment YAML.
+There is no need to copy the webhook into a second file or export it before
+each cloud launch. Direct local EWS runs still need their webhook environment
+variable set locally.
+
 Never commit either credential file. Do not paste their contents into diagnostics
 or bug reports. The tool requires credential files to be owned by your account
 and inaccessible to group/other users.
@@ -165,6 +177,33 @@ bucket = "migwings-experiments"
 repository = "https://github.com/m1gwings/experiments-wo-stress.git"
 default_ref = "main"
 ```
+
+For studies that want EWS Discord progress, add to the existing `[run]` table
+(create it if absent; do not add duplicate TOML tables):
+
+```toml
+[run]
+ews_discord = true
+```
+
+This opts in to sharing only the webhook with the experiment process. Pair it
+with the following settings in the study's YAML, not in this TOML:
+
+```yaml
+notifications:
+  discord:
+    enabled: true
+    webhook_env: EWS_DISCORD_WEBHOOK_URL
+    interval_seconds: 300
+    timeout_seconds: 5
+```
+
+No EWS code change is required. Forwarding defaults to off; enabling the YAML
+alone does not supply a credential. With forwarding on, a missing webhook is
+rejected before input uploads or compute creation. Changing `worker.env` affects
+future launches and reproductions, not workers that already started. Read the
+[Discord section](../README.md#discord-configure-once-reuse-across-studies) for
+credential isolation and reproduction behavior.
 
 There are no API keys in this file. `heavy_server_type` documents your preferred
 larger machine; choose it explicitly with `--machine cpx52`. Hardware availability
@@ -321,7 +360,10 @@ worker token, selected S3 remote credentials, and optional Discord webhook reach
 the VM, through root-only cloud-init files. Cloud-init credentials pass through
 Hetzner's API/user-data storage, not just SSH; project administrators remain
 trusted. They disappear with the VM. Run/config manifests never contain them.
-The unprivileged experiment cannot read the root credentials. Experiment source
+The unprivileged experiment cannot read Hetzner/S3 root credentials. An explicitly
+enabled `run.ews_discord` shares only the webhook through a protected systemd
+credential outside the captured workspace, then EWS's environment variable.
+Do not print environment/credential dumps from experiments. Experiment source
 and logs are private research data; protect the bucket and downloaded results.
 
 On a new laptop: install the CLIs/Python; clone this private tooling repository;

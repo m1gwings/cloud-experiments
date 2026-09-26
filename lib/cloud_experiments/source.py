@@ -12,7 +12,7 @@ from .common import Error, SHA_RE, command, sha256
 from .config import repository_url
 
 CACHE_DIRS = {".git", ".venv", "venv", "__pycache__", ".cache", ".pytest_cache", ".mypy_cache", ".ruff_cache", "node_modules"}
-SECRET_NAMES = {".env", "worker.env", "rclone.conf", "credentials", "secrets", ".ssh", ".aws", ".config"}
+SECRET_NAMES = {".env", "worker.env", "rclone.conf", "credentials", "secrets", ".ssh", ".aws", ".config", "ews-discord-webhook"}
 
 
 def secret_path(path):
