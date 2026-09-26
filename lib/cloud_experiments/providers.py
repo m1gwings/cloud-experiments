@@ -4,9 +4,11 @@ import ipaddress
 import json
 from pathlib import Path
 import shlex
+import sys
 import time
 
 from .common import Error, command, managed_server, remote_path, require_managed, valid_run
+from .progress import Activity, activity
 
 
 class Hetzner:
@@ -14,7 +16,10 @@ class Hetzner:
         self.config = config
 
     def call(self, *args, **kwargs):
-        return command(["hcloud", "--context", self.config["context"], "--http-timeout", "30s", *args], **kwargs)
+        label = {"create": "Provisioning VM", "list": "Looking up cloud workers",
+                 "delete": "Deleting VM", "describe": "Verifying VM identity"}.get(args[1], "Contacting cloud provider")
+        with Activity(label, delay=0.5 if args[1] in ("list", "describe") else 0):
+            return command(["hcloud", "--context", self.config["context"], "--http-timeout", "30s", *args], **kwargs)
 
     def servers(self, rid=None):
         selector = "managed-by=cloud-experiments"
@@ -40,6 +45,7 @@ class Hetzner:
         require_managed(server, manifest["run_id"])
         return server
 
+    @activity("Verifying and deleting VM")
     def delete(self, server, rid):
         require_managed(server, rid)
         fresh = json.loads(self.call("server", "describe", str(server["id"]), "-o", "json").stdout)
@@ -67,6 +73,7 @@ class SSH:
         # OpenSSH transmits a remote shell string; quote every argument once.
         return command(["ssh", *self.options, self.host, shlex.join([str(x) for x in args])], **kwargs)
 
+    @activity("Waiting for SSH and deadline protection")
     def wait(self, seconds=600):
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
@@ -77,6 +84,7 @@ class SSH:
                 time.sleep(3)
         raise Error("SSH/failsafe initialization did not become ready within 10 minutes.")
 
+    @activity("Uploading source to VM")
     def upload(self, paths):
         command(["scp", *self.options, *[str(Path(p).absolute()) for p in paths], self.host + ":/opt/cloud-experiments/incoming/"], timeout=1800)
 
@@ -91,7 +99,18 @@ class Storage:
         self.config_file = config["local"]["rclone_config"]
 
     def call(self, *args, timeout=1800):
-        return command(["rclone", "--config", self.config_file, "--contimeout", "15s", "--timeout", "60s", "--retries", "2", *args], timeout=timeout)
+        label = {"cat": "Reading stored manifest", "lsjson": "Listing stored runs",
+                 "copy": "Transferring files", "copyto": "Transferring stored file",
+                 "check": "Verifying stored files"}.get(args[0], "Accessing storage")
+        with Activity(label, delay=0.5 if args[0] in ("cat", "lsjson") else 0) as progress:
+            flags = []
+            kwargs = {}
+            if args[0] in ("copy", "copyto", "check"):
+                flags = ["--use-json-log", "--stats", "1s", "--stats-log-level", "NOTICE"]
+                kwargs["stderr_line"] = progress.rclone_line
+            return command(["rclone", "--config", self.config_file, "--ask-password=false",
+                            "--contimeout", "15s", "--timeout", "60s", "--retries", "2", *args, *flags],
+                           timeout=timeout, **kwargs)
 
     def path(self, rid=None):
         return remote_path(self.storage, rid)
@@ -104,21 +123,30 @@ class Storage:
 
     def manifests(self):
         entries = json.loads(self.call("lsjson", self.path(), "--dirs-only", timeout=120).stdout)
-        for entry in entries:
-            try:
-                rid = valid_run(entry["Name"])
-                yield self.manifest(rid)
-            except (Error, ValueError, KeyError):
-                print("Warning: an invalid or unreadable run manifest was skipped.")
+        manifests, skipped = [], 0
+        with Activity("Reading run manifests", delay=0.5) as progress:
+            for index, entry in enumerate(entries, 1):
+                try:
+                    rid = valid_run(entry["Name"])
+                    manifests.append(self.manifest(rid))
+                except (Error, ValueError, KeyError):
+                    skipped += 1
+                progress.count(index, len(entries))
+        if skipped:
+            print(f"Warning: {skipped} invalid or unreadable run manifest(s) skipped.", file=sys.stderr)
+        yield from manifests
 
     def upload(self, directory, rid):
-        self.call("copy", str(directory), self.path(rid))
+        with Activity("Uploading input snapshot"):
+            self.call("copy", str(directory), self.path(rid))
         self.call("check", str(directory), self.path(rid), "--one-way")
 
     def pull(self, rid, destination):
-        self.call("copy", self.path(rid), str(destination))
+        with Activity(f"Downloading {valid_run(rid)}"):
+            self.call("copy", self.path(rid), str(destination))
 
     def file(self, rid, name, destination):
         if name not in ("source/source.tar.gz", "source/index.json", "manifest.json"):
             raise Error("Unsupported reproduction artifact.")
-        self.call("copyto", self.path(rid) + "/" + name, str(destination))
+        with Activity("Downloading reproduction input"):
+            self.call("copyto", self.path(rid) + "/" + name, str(destination))

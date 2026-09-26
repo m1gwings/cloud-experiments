@@ -55,6 +55,32 @@ No command installs this tooling as root. `./install` creates symlinks in
 `~/.local/bin`, is idempotent, and refuses to replace unrelated commands. Keep
 this checkout at its installed path; rerun the installer after moving it.
 
+## Progress and terminal output
+
+Long operations report activity automatically on **stderr**. In an interactive
+terminal, downloads/uploads show a byte progress bar, speed and ETA when rclone
+reports totals; file/check counts appear when available. Totals and estimates
+can change as rclone discovers files or retries. Verification must finish before
+a transfer is reported as successful. Source preparation, VM provisioning, SSH
+readiness, source upload to the VM, environment setup, storage lookups,
+cancellation/finalization requests, and reproduction show activity while waiting.
+Reading a collection of manifests reports how many have been processed.
+
+When either stdout or stderr is redirected, `TERM=dumb`, or `NO_COLOR` is set
+to a nonempty value, output uses plain stage messages and updates about every
+15 seconds, with no animation or ANSI escapes. Interactive displays use no
+color. Fast metadata lookups stay quiet unless they fail. Tables and downloaded
+paths remain on stdout for scripts. `cloud-results sync` ends with downloaded
+and unchanged counts, including when there is nothing to download.
+
+Only numeric rclone statistics are displayed: raw subprocess logs, filenames,
+URLs and credential-bearing messages stay captured and are never streamed to
+the terminal. Failed commands still return nonzero status with safe error
+messages. Ctrl-C stops an active transfer; rerunning `pull` uses rclone's
+incremental copy behavior. A download marker is written only after success.
+Cancelling a run reports that finalization was **requested**, not that uploads
+or VM deletion have already finished; check `cloud-status` afterwards.
+
 ## What runs
 
 The experiment repository must have an `origin` HTTPS/SSH remote and a commit.

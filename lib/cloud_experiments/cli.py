@@ -17,6 +17,7 @@ from .bootstrap import render
 from .common import Error, FINAL, SHA_RE, read_json, run_id, sha256, utcnow, valid_run, write_json
 from .config import DEPENDENCIES, load, repository_url, run_settings, runtime_hours, storage_credentials, worker_secrets
 from .providers import Hetzner, SSH, Storage
+from .progress import Activity
 from .source import extract_snapshot, resolve_ref, snapshot
 
 
@@ -82,33 +83,36 @@ def launch(config, manifest, directory):
         print("✓ VM ready (both deadline timers armed)")
         ssh.upload([out / "source/source.tar.gz", out / "source/index.json"])
         print("✓ source uploaded")
-        ssh.call(["systemctl", "start", "cloud-supervisor.service"])
-        until = time.monotonic() + min(2400, manifest["max_runtime_hours"] * 3600)
-        while time.monotonic() < until:
-            try:
-                result = ssh.call(["test", "-f", "/opt/cloud-experiments/started"], check=False, timeout=20)
-                if result.returncode == 0:
-                    print("✓ environment ready\n✓ experiment started")
-                    break
-                status = json.loads(ssh.call(["cat", "/opt/cloud-experiments/manifest.json"], timeout=20).stdout)
-                if status["status"] in FINAL:
-                    if status["status"] == "setup_failed":
+        with Activity("Starting environment setup"):
+            ssh.call(["systemctl", "start", "cloud-supervisor.service"])
+        with Activity("Installing environment and waiting for launch"):
+            until = time.monotonic() + min(2400, manifest["max_runtime_hours"] * 3600)
+            while time.monotonic() < until:
+                try:
+                    result = ssh.call(["test", "-f", "/opt/cloud-experiments/started"], check=False, timeout=20)
+                    if result.returncode == 0:
+                        launch_message = "✓ environment ready\n✓ experiment started"
+                        break
+                    status = json.loads(ssh.call(["cat", "/opt/cloud-experiments/manifest.json"], timeout=20).stdout)
+                    if status["status"] in FINAL:
+                        if status["status"] == "setup_failed":
+                            raise Error("Worker setup failed; inspect cloud-results pull " + rid)
+                        launch_message = f"Run already finished: {status['status']}"
+                        break
+                except Error:
+                    # Very short runs can delete the server before the next SSH poll.
+                    remote = storage.manifest(rid)
+                    if remote.get("started_at") and remote["status"] in FINAL:
+                        launch_message = f"Run already finished: {remote['status']}"
+                        break
+                    if remote["status"] == "setup_failed":
                         raise Error("Worker setup failed; inspect cloud-results pull " + rid)
-                    print(f"Run already finished: {status['status']}")
-                    break
-            except Error:
-                # Very short runs can delete the server before the next SSH poll.
-                remote = storage.manifest(rid)
-                if remote.get("started_at") and remote["status"] in FINAL:
-                    print(f"Run already finished: {remote['status']}")
-                    break
-                if remote["status"] == "setup_failed":
-                    raise Error("Worker setup failed; inspect cloud-results pull " + rid)
-                if cloud.find(rid) is None:
-                    raise Error("VM disappeared before launch confirmation; inspect cloud-results pull " + rid)
-            time.sleep(3)
-        else:
-            raise Error("Environment setup did not finish within the launch wait limit.")
+                    if cloud.find(rid) is None:
+                        raise Error("VM disappeared before launch confirmation; inspect cloud-results pull " + rid)
+                time.sleep(3)
+            else:
+                raise Error("Environment setup did not finish within the launch wait limit.")
+        print(launch_message)
     except (Exception, KeyboardInterrupt) as exc:
         # A create call can succeed server-side but fail locally before JSON arrives.
         try:
@@ -117,7 +121,8 @@ def launch(config, manifest, directory):
                 ssh = ssh or ssh_for(config, server)
                 reason = "cancelled" if isinstance(exc, KeyboardInterrupt) else "setup_failed"
                 try:
-                    ssh.call(["/usr/bin/python3", "/opt/cloud-experiments/entry.py", reason], timeout=30)
+                    with Activity("Requesting worker finalization"):
+                        ssh.call(["/usr/bin/python3", "/opt/cloud-experiments/entry.py", reason], timeout=30)
                     print("Worker finalization requested; deadline protection remains active.")
                 except Exception:
                     cloud.delete(server, rid)
@@ -143,13 +148,17 @@ def run_command(args, config):
     directory = state(config, rid)
     out = directory / "out"
     (out / "source").mkdir(parents=True)
-    experiment, config_path, index = snapshot(Path.cwd(), args.experiment_config, out / "source/source.tar.gz", args.allow_dirty)
+    with Activity("Preparing source snapshot"):
+        experiment, config_path, index = snapshot(Path.cwd(), args.experiment_config, out / "source/source.tar.gz", args.allow_dirty)
     write_json(out / "source/index.json", index)
     (out / "config").mkdir()
     (out / "source/experiment-config").replace(out / "config/experiment-config")
     ref = args.ews_ref or config["ews"]["default_ref"]
-    commit = resolve_ref(config["ews"]["repository"], ref)
-    manifest = new_manifest(config, rid, experiment, config_path, sha256(out / "source/source.tar.gz"),
+    with Activity("Resolving pinned EWS revision"):
+        commit = resolve_ref(config["ews"]["repository"], ref)
+    with Activity("Checksumming source snapshot"):
+        source_sha = sha256(out / "source/source.tar.gz")
+    manifest = new_manifest(config, rid, experiment, config_path, source_sha,
                             index[config_path]["sha256"], {"repository": config["ews"]["repository"], "requested_ref": ref, "commit": commit},
                             machine=args.machine, hours=args.max_runtime, keep=args.keep_on_setup_failure)
     launch(config, manifest, directory)
@@ -186,7 +195,7 @@ def reproduce(args, config):
     (out / "source").mkdir(parents=True)
     storage.file(args.run_id, "source/source.tar.gz", out / "source/source.tar.gz")
     # Derive index and config from the checksummed immutable archive, never live Git.
-    with tempfile.TemporaryDirectory(prefix="cloud-reproduce-") as temp:
+    with Activity("Verifying and preparing reproduction"), tempfile.TemporaryDirectory(prefix="cloud-reproduce-") as temp:
         extract_snapshot(out / "source/source.tar.gz", temp, manifest["source"]["sha256"])
         from .source import inventory
         index, _ = inventory(temp)
@@ -203,6 +212,7 @@ def attach(args, config):
     server = Hetzner(config["hetzner"]).find(valid_run(args.run_id))
     if not server:
         raise Error(f"No active VM for {args.run_id}; it likely completed or failed. Use cloud-results pull {args.run_id}.")
+    print("Connecting to the experiment terminal...", file=sys.stderr, flush=True)
     return subprocess.call(ssh_for(config, server).attach_argv())
 
 
@@ -251,7 +261,8 @@ def cancel(args, config):
         cloud.delete(server, rid)
         print("VM deleted. The remote manifest may still show its previous status.")
     else:
-        ssh_for(config, server).call(["/usr/bin/python3", "/opt/cloud-experiments/entry.py", "cancelled"])
+        with Activity("Requesting cancellation and finalization"):
+            ssh_for(config, server).call(["/usr/bin/python3", "/opt/cloud-experiments/entry.py", "cancelled"])
         print("Graceful cancellation requested; the worker will upload partial results and delete itself.")
 
 
@@ -263,6 +274,7 @@ def pull_run(storage, config, rid, destination=None):
     # Marker only after a successful complete download; running manifests get refreshed.
     manifest = read_json(destination / "manifest.json")
     write_json(destination / ".cloud-pulled.json", {"manifest": manifest})
+    print(f"Download complete: {rid}", file=sys.stderr, flush=True)
     print(destination)
 
 
@@ -275,12 +287,16 @@ def results(args, config):
     elif args.operation == "pull":
         pull_run(storage, config, args.run_id, args.dest)
     else:
+        downloaded = skipped = 0
         for manifest in storage.manifests():
             rid = manifest["run_id"]
             marker = Path(config["local"]["results_dir"]) / rid / ".cloud-pulled.json"
             if manifest["status"] in FINAL and marker.exists() and read_json(marker).get("manifest") == manifest:
+                skipped += 1
                 continue
             pull_run(storage, config, rid)
+            downloaded += 1
+        print(f"Sync complete: {downloaded} downloaded, {skipped} unchanged.", file=sys.stderr, flush=True)
 
 
 def doctor(config):

@@ -8,6 +8,7 @@ shared package in `lib/cloud_experiments` has no third-party Python dependencies
 | `cli.py` | Commands, run orchestration, failure ownership, reproduction, downloads. |
 | `config.py` | Non-secret TOML validation; runtime-only credential selection. |
 | `common.py` | Safe subprocess wrapper, IDs, atomic JSON, hashing, label checks. |
+| `progress.py` | Nested stderr activities, TTY detection, periodic updates, numeric transfer statistics. |
 | `source.py` | Git inspection, exact snapshots, safe extraction, file inventories. |
 | `providers.py` | Structured hcloud/rclone arguments; quoted SSH; remote manifests. |
 | `bootstrap.py` | Compressed Python bundle and systemd units in cloud-init JSON/YAML. |
@@ -120,6 +121,24 @@ option grants the research process webhook access, not Hetzner/S3 access.
 temporary directories and mocked provider effects. Synthetic tokens never leave
 the test process. Provider subprocess errors omit raw output and command
 arguments; error redaction is tested. No live integration test runs by default.
+
+CLI activities use a small stdlib background ticker so blocking library work
+and retry loops remain visible. Nested activities share the outer display;
+failure and interruption close it before error handling continues. Either
+redirected output stream, `TERM=dumb`, or nonempty `NO_COLOR` disables animation.
+Quick metadata calls defer their display to avoid noisy result listings.
+
+Transfer commands opt into [rclone JSON statistics](https://rclone.org/docs/#use-json-log)
+with `--use-json-log --stats 1s --stats-log-level NOTICE`, never raw `--progress`.
+The subprocess wrapper drains stdout and stderr concurrently with selectors,
+retains the captured bytes and return status, and feeds bounded stderr lines to
+a numeric-field allowlist. Messages, object names, URLs, invalid values and
+non-statistics records are never displayed. Capture-only commands (including
+manifest reads and provider JSON) keep the original subprocess path. Transfer
+timeouts and interruption kill/reap the process group before reporting failure.
+Tests exercise both pipe modes, malformed/oversized records, error privacy,
+interruption, download markers, and a real rclone copy/check between temporary
+local directories with an empty configuration; this never uses Object Storage.
 
 The provider adapter follows the official [hcloud create flags](https://github.com/hetznercloud/cli/blob/main/docs/reference/manual/hcloud_server_create.md)
 and [JSON/label-filtered list interface](https://github.com/hetznercloud/cli/blob/main/docs/reference/manual/hcloud_server_list.md).

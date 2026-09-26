@@ -6,7 +6,10 @@ import json
 import os
 from pathlib import Path
 import re
+import selectors
+import signal
 import subprocess
+import time
 import uuid
 
 MANAGED = {"managed-by": "cloud-experiments"}
@@ -58,7 +61,73 @@ def read_json(path):
     return json.loads(Path(path).read_text())
 
 
-def command(argv, *, cwd=None, input=None, timeout=120, check=True, env=None):
+def _stream_command(argv, *, cwd, input, timeout, env, stderr_line):
+    """Drain both pipes while inspecting bounded stderr lines; preserve captured bytes."""
+    with subprocess.Popen(argv, cwd=cwd, stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
+                          start_new_session=True) as process:
+        output, errors = bytearray(), bytearray()
+        pending = bytearray()
+        oversized = False
+        deadline = time.monotonic() + timeout
+        try:
+            with selectors.DefaultSelector() as selector:
+                selector.register(process.stdout, selectors.EVENT_READ, output)
+                selector.register(process.stderr, selectors.EVENT_READ, errors)
+                if input:
+                    os.set_blocking(process.stdin.fileno(), False)
+                    selector.register(process.stdin, selectors.EVENT_WRITE, memoryview(input))
+                elif process.stdin:
+                    process.stdin.close()
+                while selector.get_map():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired(argv, timeout)
+                    for key, _ in selector.select(min(remaining, 0.2)):
+                        if key.fileobj is process.stdin:
+                            try:
+                                sent = os.write(key.fd, key.data[:4096])
+                                rest = key.data[sent:]
+                            except BrokenPipeError:
+                                rest = b""
+                            if rest:
+                                selector.modify(key.fileobj, selectors.EVENT_WRITE, rest)
+                            else:
+                                selector.unregister(key.fileobj)
+                                key.fileobj.close()
+                            continue
+                        chunk = os.read(key.fd, 65536)
+                        if not chunk:
+                            selector.unregister(key.fileobj)
+                            continue
+                        key.data.extend(chunk)
+                        if key.fileobj is process.stderr:
+                            for part in chunk.splitlines(keepends=True):
+                                pending.extend(part)
+                                if len(pending) > 65536:
+                                    oversized = True
+                                if part.endswith(b"\n"):
+                                    if not oversized:
+                                        stderr_line(bytes(pending))
+                                    pending.clear()
+                                    oversized = False
+                                elif oversized:
+                                    pending.clear()
+                if pending and not oversized:
+                    stderr_line(bytes(pending))
+                process.wait(timeout=max(0, deadline - time.monotonic()))
+        except BaseException:
+            # Stop the transfer (and any helpers) on timeout or Ctrl-C, then reap it.
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+            raise
+        return subprocess.CompletedProcess(argv, process.returncode, bytes(output), bytes(errors))
+
+
+def command(argv, *, cwd=None, input=None, timeout=120, check=True, env=None, stderr_line=None):
     """No shell; captured output is deliberately omitted from exceptions."""
     child_env = dict(os.environ if env is None else env)
     for key in list(child_env):
@@ -66,8 +135,13 @@ def command(argv, *, cwd=None, input=None, timeout=120, check=True, env=None):
             child_env.pop(key)
     child_env["GIT_TERMINAL_PROMPT"] = "0"
     try:
-        result = subprocess.run([str(a) for a in argv], cwd=cwd, input=input,
-                                capture_output=True, timeout=timeout, env=child_env)
+        args = [str(a) for a in argv]
+        if stderr_line is None:
+            result = subprocess.run(args, cwd=cwd, input=input,
+                                    capture_output=True, timeout=timeout, env=child_env)
+        else:
+            result = _stream_command(args, cwd=cwd, input=input, timeout=timeout,
+                                     env=child_env, stderr_line=stderr_line)
     except subprocess.TimeoutExpired:
         raise Error(f"{Path(argv[0]).name} exceeded its {timeout}s time limit.") from None
     except OSError:
