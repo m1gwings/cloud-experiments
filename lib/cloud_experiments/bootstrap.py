@@ -4,6 +4,7 @@ import base64
 import datetime as dt
 import io
 import json
+import lzma
 from pathlib import Path
 import zipfile
 
@@ -24,11 +25,11 @@ def render(manifest, secrets, rclone_config):
                       "content": base64.b64encode(content).decode()})
 
     bundle = io.BytesIO()
-    with zipfile.ZipFile(bundle, "w", zipfile.ZIP_DEFLATED) as z:
-        for name in ("__init__.py", "common.py", "config.py", "source.py", "worker.py"):
+    with zipfile.ZipFile(bundle, "w", zipfile.ZIP_STORED) as z:
+        for name in ("__init__.py", "common.py", "config.py", "source.py", "worker.py", "studies.py", "environment.py", "persistence.py"):
             z.write(Path(__file__).parent / name, "cloud_experiments/" + name)
-    add("/opt/cloud-experiments/code.zip", bundle.getvalue(), "0644")
-    add("/opt/cloud-experiments/entry.py", "import sys\nsys.path.insert(0, '/opt/cloud-experiments/code.zip')\nfrom cloud_experiments.worker import main\nmain()\n", "0644")
+    add("/opt/cloud-experiments/code.zip.xz", lzma.compress(bundle.getvalue(), preset=9), "0644")
+    add("/opt/cloud-experiments/entry.py", "import sys, os, lzma\nfrom pathlib import Path\np=Path('/opt/cloud-experiments/code.zip')\nif not p.exists():\n t=p.with_name('code-'+str(os.getpid())+'.tmp')\n t.write_bytes(lzma.decompress(p.with_suffix('.zip.xz').read_bytes()))\n t.chmod(0o644)\n os.replace(t,p)\nsys.path.insert(0,str(p))\nfrom cloud_experiments.worker import main\nmain()\n", "0644")
     add("/opt/cloud-experiments/manifest.json", json.dumps(manifest))
     add("/opt/cloud-experiments/credentials.json", json.dumps(secrets))
     add("/opt/cloud-experiments/rclone.conf", rclone_config)

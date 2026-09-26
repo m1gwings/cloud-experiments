@@ -2,6 +2,9 @@
 
 Reusable commands for disposable Hetzner research workers: freeze your experiment
 source, pin EWS, run in tmux, save results to Object Storage, and delete the VM.
+Repeated `cloud-run CONFIG` restores and continues the same logical EWS study.
+Machine and runtime settings belong to each attempt, not the study identity.
+See [automatic continuation](docs/continuation.md) for storage, locking, and compatibility.
 There is no project-specific experiment code, Docker, database, or hosted service.
 Python 3.11+ and the existing `hcloud`, `rclone`, `git`, `ssh`, and `scp` CLIs are
 the only laptop dependencies.
@@ -29,12 +32,13 @@ project, `nbg1`, and `migwings-experiments` bucket described there.
 
 | Command | Behavior |
 | --- | --- |
-| `cloud-run CONFIG` | Snapshot the current Git repository, provision, install, and return after launch. |
+| `cloud-run CONFIG` | Continue the repository/config study; restore verified state, or skip compute if exactly completed. |
+| `cloud-results list --attempts STUDY_ID` | Inspect all attempts of a logical study. |
 | `cloud-attach RUN_ID` | Attach to the active experiment's tmux terminal. |
 | `cloud-status [RUN_ID]` | Show managed active VMs, or a stored manifest for a completed run. |
 | `cloud-results list` | Read remote manifests, including failed and incomplete runs. |
 | `cloud-results ls RUN_ID [--json]` | Recursively list remote file paths and sizes without downloading contents. |
-| `cloud-results pull RUN_ID [--dest PATH]` | Download the full run, by default to `~/cloud-results/RUN_ID`. |
+| `cloud-results pull RUN_ID [--dest PATH]` | Download a full study (all attempts), attempt, or legacy run, by default to `~/cloud-results/RUN_ID`. |
 | `cloud-results pull RUN_ID --plots` | Resolve the EWS `figures` role; succeed with an explanation if optional files are absent. |
 | `cloud-results pull RUN_ID --analysis` | Resolve the EWS `analysis` role; does not execute analysis. |
 | `cloud-results pull RUN_ID --report` | Resolve the EWS `compute_report` role. |
@@ -42,7 +46,7 @@ project, `nbg1`, and `migwings-experiments` bucket described there.
 | `cloud-results sync` | Retrieve new/changed full runs; skip final manifests already fully downloaded. |
 | `cloud-cancel RUN_ID [--yes]` | Ask the worker to stop, upload partial results, and delete itself. |
 | `cloud-cancel RUN_ID --force-delete [--yes]` | Delete an unreachable managed VM; unsaved results can be lost. |
-| `cloud-reproduce RUN_ID [--name NAME]` | Launch a new run from stored input and pinned settings. |
+| `cloud-reproduce RUN_ID [--name NAME]` | Create an independent lineage from archived inputs/settings/environment; never resume its output. |
 | `cloud-doctor` | Offline executable/config checks; never reads secrets or contacts providers. |
 
 `cloud-run` options:
@@ -50,8 +54,10 @@ project, `nbg1`, and `migwings-experiments` bucket described there.
 ```text
 --machine TYPE             override default_server_type
 --ews-ref REF              branch, tag, or full 40-character Git commit
---name NAME                readable prefix; UTC timestamp + random suffix added
---max-runtime HOURS        positive finite duration, at most 168 hours
+--name NAME                descriptive attempt label (does not change study identity)
+--fresh                    intentionally start a new independent study lineage
+--study STUDY_ID           continue an explicit fresh/reproduction lineage
+--max-runtime HOURS        per-attempt limit including setup, at most 168 hours
 --allow-dirty              explicitly execute a dirty working-tree snapshot
 --keep-on-setup-failure    retain a failed setup until the original deadline
 ```
@@ -125,14 +131,14 @@ ews_discord = false         # optional EWS progress messages; see below
 
 This is an argument array, not a shell snippet. `{config}` is the config's
 repository-relative path; `{output}` is `/work/output`. Execution starts in
-`/work/source` with the virtual environment on `PATH`. For other frameworks:
+`/work/source` with the virtual environment on `PATH`. Automatic continuation
+requires this standard EWS argument array and adds `--portable`. GPU/custom
+checkpoint backends are unsupported; old custom commands remain archived and
+reproducible with their original strict behavior. The first prepared environment
+locks exact runtime and index package versions. Subsequent attempts recreate and
+validate that lock before EWS can load checkpoints. See
+[continuation compatibility](docs/continuation.md#environment-recreation-and-ews-authority).
 
-```toml
-[run]
-command = ["python", "run_study.py", "--config", "{config}", "--output", "{output}"]
-```
-
-Use your own checked-in script for pipelines or additional setup logic.
 `HOME=/work/home`, `TMPDIR=/work/home`, and `CLOUD_EXPERIMENTS_OUTPUT=/work/output`
 keep ordinary generated files within the captured workspace. The experiment
 runs as `experiment`; credentials and finalization run as root. The real command
@@ -183,17 +189,24 @@ report upload outcomes and precede the deletion request, not confirmed deletion.
 
 ## Results and provenance
 
-Object Storage layout is stable:
+IDs in result commands can be logical study IDs (`s-...`), individual attempt IDs
+(`a-...`), or legacy run IDs. New storage uses `studies/STUDY_ID/attempts/ATTEMPT_ID/`
+for the following attempt archive, with parent-linked state commits and environment
+locks beside `attempts/`. See the [complete layout](docs/continuation.md#storage-and-publication).
+Legacy `runs/RUN_ID/` remains readable without migration.
+
+Attempt archive:
 
 ```text
-hetzner:migwings-experiments/runs/RUN_ID/
+hetzner:migwings-experiments/studies/STUDY_ID/attempts/ATTEMPT_ID/
   manifest.json
   source/source.tar.gz
   source/index.json
   config/experiment-config
   artifacts/index.json
   artifacts/source/...       # new/modified files under the source tree
-  artifacts/output/...       # normal EWS outputs
+  artifacts/output/...       # complete EWS output including restored checkpoints
+  ews-state.json             # all output file SHA-256 values and modes
   artifacts/home/...         # generated files under HOME/TMPDIR
   artifacts/...              # other new/modified files anywhere under /work
   logs/setup.log
@@ -201,6 +214,7 @@ hetzner:migwings-experiments/runs/RUN_ID/
   logs/worker.log            # when setup/execution fails
   machine/runtime.json
   machine/pip-freeze.txt
+  machine/environment.json   # recreatable exact runtime/package lock
 ```
 
 The manifest records repository/commit/dirty state; source and config SHA-256;
@@ -212,7 +226,8 @@ Missing runtime fields mean setup had not reached that stage. Inputs and a
 worker publishes `running` before launch and a final `completed`, `failed`,
 `cancelled`, `timeout`, or `setup_failed` manifest after uploading artifacts.
 
-Artifact collection compares file content and executable bits with the initial
+The entire EWS output is preserved independently of exclusions or deltas. Other
+artifact collection compares file content and executable bits with the initial
 snapshot. It also captures new files throughout `/work`, regardless of extension
 or expected output directory. Deleted source paths and excluded paths are
 recorded in `artifacts/index.json`; symlinks are never followed. Git, environments,
@@ -232,7 +247,8 @@ still retrieves its full archive.
 
 ## Inspect remote results and download selected files
 
-Use `list` to find run IDs, then `ls` to inspect the files inside one run:
+Use `list` to find studies, `list --attempts STUDY_ID` for execution history, then
+`ls` to inspect the chosen study or attempt:
 
 ```bash
 cloud-results list
@@ -260,8 +276,9 @@ cloud-results pull RUN_ID --path manifest.json
 ```
 
 `--plots`, `--analysis`, and `--report` resolve the EWS semantic roles `figures`,
-`analysis`, and `compute_report`. They discover the single `artifacts.json` under
-captured `artifacts/` (including custom output roots), read its schema/version,
+`analysis`, and `compute_report`. On a study ID, they select the latest committed output generation. On an attempt
+or legacy ID, they discover the single `artifacts.json` under captured `artifacts/`
+(including archived custom output roots), read its schema/version,
 and resolve paths relative to its parent. EWS owns these paths; cloud-experiments
 has no mapping of EWS internal figure/analysis/report locations. The small
 catalog is fetched in addition to the file listing; unrelated result contents
@@ -294,7 +311,8 @@ validated too; the local full-download marker cannot be selected or overwritten.
 Existing symlinks within a selected local subtree are rejected.
 
 All selectors preserve the remote-relative tree inside the local run root. For
-example, with the current default EWS layout (these are examples, not mappings):
+example, for an **attempt ID** with the current default EWS layout (examples, not
+mappings; a study ID adds `attempts/ATTEMPT_ID/` before these artifact paths):
 
 ```text
 --plots                         -> ~/cloud-results/RUN_ID/artifacts/output/analysis/figures/
@@ -332,18 +350,21 @@ complete archive. These commands never modify or delete remote objects.
 
 `cloud-reproduce` verifies the stored tarball and config checksums and reuses its
 exact source, EWS commit, machine, location, command, artifact policy, and runtime
-limit. It assigns a fresh ID/deadline and adds `reproduces_run_id`. It does not
+limit. It assigns an independent study/attempt/deadline and adds `reproduces_run_id`.
+It never restores old output; ordinary continuation uses repeated `cloud-run`. It does not
 consult today's experiment Git checkout or resolve EWS `main` again. It uses the
 current laptop's storage destination, SSH key, and worker credentials. Dirty runs
-are reproduced from their stored bytes. Python/OS package versions are recorded,
-not frozen VM images: use lockfiles in experiment repositories for dependency
-reproducibility. Deletion of the public EWS repository/commit remains a limitation.
+are reproduced from their stored bytes. Modern attempts also recreate their saved
+exact environment lock. Legacy archives without a lock retain their original
+strict command and dependency limitations. This does not freeze an OS image or
+provide generic native/GPU portability. Deletion of the public EWS repository/commit remains a limitation.
 
 ## Cleanup and security
 
 The first-boot cloud-init payload installs deadline and last-resort timers before
 package installation or source transfer. The deadline includes setup time. At the
-deadline the worker stops both setup and experiment cgroups, collects outputs,
+deadline the worker stops setup, requests graceful EWS interruption for up to
+90 seconds, then stops its cgroup (20 seconds before forced kill), collects outputs,
 uploads/checks them, publishes a final manifest, optionally notifies Discord, and
 requests its own deletion. Upload failures are recorded when possible and **never
 prevent deletion**. Finalization is bounded; the separate reap timer starts API

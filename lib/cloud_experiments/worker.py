@@ -11,6 +11,8 @@ from pathlib import Path
 import platform
 import shlex
 import shutil
+import signal
+import threading
 import subprocess
 import sys
 import time
@@ -19,6 +21,7 @@ import urllib.request
 
 from .common import Error, command, read_json, redact, remote_path, require_managed, utcnow, write_json
 from .source import extract_snapshot, inventory
+from . import environment, persistence
 
 BASE = Path("/opt/cloud-experiments")
 WORK = Path("/work")
@@ -133,12 +136,16 @@ class Worker:
         if content != manifest:
             raise Error("Uploaded manifest verification failed.")
 
-    def user_step(self, argv, *, cwd=None):
+    def user_step(self, argv, *, cwd=None, timeout=1200):
         env = ["env", "-i", "HOME=" + str(self.work / "home"),
                "PATH=" + str(self.work / ".venv/bin") + ":/usr/local/bin:/usr/bin:/bin",
                "LANG=C.UTF-8", "GIT_TERMINAL_PROMPT=0", "PIP_DISABLE_PIP_VERSION_CHECK=1"]
+        argv = list(argv)
+        lock = self.work / "runtime/requirements-lock.txt"
+        if argv[:4] == ["python", "-m", "pip", "install"] and lock.exists():
+            argv.extend(["--constraint", str(lock)])
         result = self.run(["runuser", "-u", "experiment", "--", *env, *map(str, argv)], cwd=cwd,
-                          timeout=1200, check=False)
+                          timeout=timeout, check=False)
         with (self.out / "logs/setup.log").open("ab") as log:
             # Experiment/pip has no worker secrets in its environment, still redact defensively.
             clean = redact((result.stdout + result.stderr).decode(errors="replace"), self.secrets().values())
@@ -146,6 +153,38 @@ class Worker:
         if result.returncode:
             raise Error("Worker environment installation failed; see logs/setup.log.")
         return result
+
+    def verify_lease(self, manifest):
+        """Fence restoration/publication against the live provider identity, not stale objects."""
+        if not manifest.get("study_id"):
+            return
+        identity = own_server_id()
+        if manifest.get("server_id") != identity:
+            raise Error("Continuation VM identity changed; refusing study writes.")
+        response = http_json(f"{API}/servers/{identity}", token=self.secrets()["HCLOUD_WORKER_TOKEN"])
+        if response is None:
+            raise Error("Study VM lease has ended; refusing state publication.")
+        require_managed(response["server"], manifest["run_id"])
+        if response["server"]["id"] != identity:
+            raise Error("Study lease provider identity mismatch.")
+
+    def capture_environment(self):
+        return environment.decode(self.user_step(["python", "-c", environment.CAPTURE]).stdout)
+
+    def seal_environment(self, manifest, expected):
+        actual = self.capture_environment()
+        if expected:
+            environment.verify(expected, actual)
+        write_json(self.out / "machine/environment.json", actual)
+        record = {"attempt_id": manifest["run_id"], "created_at": manifest["created_at"], "environment": actual}
+        self.verify_lease(manifest)
+        path = self.base / "environment-record.json"
+        write_json(path, record)
+        remote = remote_path(manifest["storage"], manifest["study_id"]) + "/environments/" + manifest["run_id"] + ".json"
+        self.rclone("copyto", str(path), remote, timeout=45)
+        if json.loads(self.rclone("cat", remote, timeout=30).stdout) != record:
+            raise Error("Environment lock publication failed.")
+        write_json(self.base / "environment-ready.json", actual)
 
     def supervise(self):
         m = self.manifest()
@@ -172,6 +211,16 @@ class Worker:
             shutil.copyfile(self.base / "incoming/index.json", self.out / "source/index.json")
             (self.out / "config").mkdir(exist_ok=True)
             shutil.copyfile(self.work / "source" / m["config"]["path"], self.out / "config/experiment-config")
+            expected_environment = persistence.restore(self, m) if m.get("study_id") else None
+            if not expected_environment and m.get("reproduction_environment_sha256"):
+                from .common import sha256
+                path = self.base / "incoming/environment.json"
+                if sha256(path) != m["reproduction_environment_sha256"]:
+                    raise Error("Archived reproduction environment checksum mismatch.")
+                expected_environment = environment.decode(path.read_bytes())
+            if expected_environment:
+                write_json(self.base / "expected-environment.json", expected_environment)
+                (self.work / "runtime/requirements-lock.txt").write_text(environment.constraints(expected_environment))
             self.run(["chown", "-R", "experiment:experiment", str(self.work)])
             ews = self.work / ".ews"
             self.user_step(["git", "init", str(ews)])
@@ -181,6 +230,11 @@ class Worker:
             if resolved != m["ews"]["commit"]:
                 raise Error("EWS checkout did not match the pinned commit.")
             self.user_step(["python3", "-m", "venv", str(self.work / ".venv")])
+            if expected_environment:
+                runtime = self.capture_environment()["runtime"]
+                if runtime != expected_environment["runtime"]:
+                    raise Error("Worker Python/ABI/architecture/libc differs from the continuation lock; no checkpoint loaded.")
+                self.user_step(["python", "-m", "pip", "install", "--only-binary=:all:", "-r", str(self.work / "runtime/requirements-lock.txt")])
             self.user_step(["python", "-m", "pip", "install", "-e", str(ews)])
             source = self.work / "source"
             if m["settings"]["install_experiment"] == "auto":
@@ -193,12 +247,21 @@ class Worker:
             frozen = self.user_step(["python", "-m", "pip", "freeze"]).stdout.decode(errors="replace")
             (self.out / "machine").mkdir(exist_ok=True)
             (self.out / "machine/pip-freeze.txt").write_text(redact(frozen, self.secrets().values()))
+            if m.get("study_id"):
+                # Capability check plus configuration validation before starting any scientific work.
+                if m.get("portable_continuation", True):
+                    self.user_step(["python", "-c", "from experiments_wo_stress import load_config; from experiments_wo_stress.execution.portability import portable_environment; import sys; portable_environment(load_config(sys.argv[1]))", str(source / m["config"]["path"])])
+                self.seal_environment(m, expected_environment)
             baseline, _ = inventory(self.work, self.patterns(m))
             # Source baseline always means the uploaded snapshot, before pip/build hooks.
             baseline = {k: v for k, v in baseline.items() if not k.startswith("source/")}
             baseline.update({"source/" + k: v for k, v in read_json(self.base / "incoming/index.json").items()})
             write_json(self.base / "baseline.json", baseline)
             argv = [part.replace("{config}", m["config"]["path"]).replace("{output}", str(self.work / "output")) for part in m["settings"]["command"]]
+            if m.get("study_id"):
+                if m.get("portable_continuation", True):
+                    argv.append("--portable")
+                (self.work / "runtime/portable").touch()
             write_json(self.work / "runtime/command.json", argv, mode=0o644)
             m.update(status="running", started_at=utcnow(), executed_command=argv)
             m["machine_info"] = self.machine_info()
@@ -217,14 +280,17 @@ class Worker:
                 if active.returncode:
                     raise Error("Experiment tmux service exited without a completion record.")
                 time.sleep(2)
-        except Exception:
+        except Exception as exc:
+            m["setup_error"] = str(exc) if isinstance(exc, Error) else "Worker setup/execution failed (details withheld)."
+            self.save(m)
             print("Worker setup/execution failed; finalizing (details withheld).", flush=True)
             with (self.out / "logs/worker.log").open("a") as log:
-                log.write(utcnow() + " Worker setup/execution failed; see setup.log and console.log.\n")
+                log.write(utcnow() + " " + m["setup_error"] + "\n")
             self.request("failed" if (self.base / "started").exists() else "setup_failed")
 
     def patterns(self, manifest):
-        return ["runtime", "runtime/*", ".ews", ".ews/*", *manifest["settings"]["artifact_exclude"]]
+        owned = ["output", "output/*"] if manifest.get("study_id") else []
+        return ["runtime", "runtime/*", ".ews", ".ews/*", *owned, *manifest["settings"]["artifact_exclude"]]
 
     def machine_info(self):
         return {"python": sys.version, "platform": platform.platform(), "uname": list(platform.uname()),
@@ -250,6 +316,25 @@ class Worker:
         info = self.machine_info()
         write_json(self.out / "machine/runtime.json", info)
         manifest["machine_info"] = info
+        if manifest.get("study_id"):
+            persistence.collect_state(self, manifest)
+            if manifest.get("state_inventory_sha256"):
+                try:
+                    result = self.user_step(["ews", "inspect", str(self.work / "output")], timeout=30)
+                    manifest["ews_counts"] = json.loads(result.stdout)["counts"]
+                except Exception:
+                    manifest["ews_counts"] = {}  # Can retain state; cannot claim exact completion.
+
+    def interrupt_experiment(self, grace=90):
+        """Ask the unprivileged PTY wrapper to signal EWS alone, then bound the wait."""
+        if not (self.base / "started").exists():
+            return
+        (self.work / "runtime/stop-requested").touch(mode=0o644)
+        until = time.monotonic() + grace
+        while time.monotonic() < until:
+            if (self.work / "runtime/exit.json").exists():
+                return
+            time.sleep(0.2)
 
     def finalize(self):
         with (self.base / "finalize.lock").open("a") as lock:
@@ -263,9 +348,14 @@ class Worker:
                     self.systemctl("start", "--no-block", "cloud-delete.service")
                 return
             try:
-                # Stop both cgroups. systemd escalates to SIGKILL after 20 seconds.
-                self.systemctl("stop", "cloud-supervisor.service", timeout=40, check=False)
-                self.systemctl("stop", "cloud-experiment.service", timeout=40, check=False)
+                # Stop setup first, then request a safe EWS boundary before cgroup teardown.
+                supervisor = self.systemctl("stop", "cloud-supervisor.service", timeout=40, check=False)
+                if supervisor.returncode:
+                    raise Error("Setup cgroup did not stop; refusing a live filesystem snapshot.")
+                self.interrupt_experiment()
+                stopped = self.systemctl("stop", "cloud-experiment.service", timeout=40, check=False)
+                if stopped.returncode:
+                    raise Error("Experiment cgroup did not stop; refusing a live filesystem snapshot.")
                 m.update(reason)
                 m["finished_at"] = utcnow()
                 start = dt.datetime.fromisoformat(m.get("started_at") or m["created_at"])
@@ -274,10 +364,13 @@ class Worker:
                 try:
                     self.collect(m)
                 except Exception:
+                    m.pop("state_inventory_sha256", None)
                     m["collection_error"] = "Artifact collection was incomplete; compute cleanup takes priority."
                 self.save(m)
                 try:
                     self.upload(m, final=True)
+                    if m.get("study_id"):
+                        persistence.publish_state(self, m)
                 except Exception:
                     m["upload"] = {"status": "failed", "error": "Upload or verification failed; some artifacts may be missing."}
                     self.save(m)
@@ -311,9 +404,32 @@ def execute(work=WORK):
         except (OSError, ValueError):
             raise Error("EWS Discord runtime credential is missing or invalid; value withheld.") from None
         env["EWS_DISCORD_WEBHOOK_URL"] = webhook
+    # The child shim records the EWS process ID before exec. Signals originate in
+    # this unprivileged wrapper, never from root using an untrusted PID file.
+    done = threading.Event()
+    def interrupt():
+        while not done.wait(0.2):
+            if (work / "runtime/stop-requested").exists():
+                try:
+                    pid = read_json(work / "runtime/child-pid.json")["pid"]
+                    if type(pid) is int and pid > 1:
+                        os.kill(pid, signal.SIGINT)
+                        return
+                except (OSError, ValueError, KeyError):
+                    pass
+    thread = None
+    if (work / "runtime/portable").exists():
+        argv = ["/usr/bin/python3", "/opt/cloud-experiments/entry.py", "child"]
+        thread = threading.Thread(target=interrupt, daemon=True)
+        thread.start()
     # script supplies the experiment with a real PTY for EWS's dashboard and logs it.
-    result = subprocess.run(["script", "--quiet", "--return", "--flush", "--command", shlex.join(argv),
-                             str(work / "runtime/console.log")], cwd=work / "source", env=env)
+    try:
+        result = subprocess.run(["script", "--quiet", "--return", "--flush", "--command", shlex.join(argv),
+                                 str(work / "runtime/console.log")], cwd=work / "source", env=env)
+    finally:
+        done.set()
+        if thread:
+            thread.join(timeout=1)
     write_json(work / "runtime/exit.json", {"exit_code": result.returncode})
 
 
@@ -321,7 +437,11 @@ def main():
     os.umask(0o077)
     action = sys.argv[1]
     worker = Worker()
-    if action == "execute":
+    if action == "child":
+        argv = read_json(WORK / "runtime/command.json")
+        write_json(WORK / "runtime/child-pid.json", {"pid": os.getpid()})
+        os.execvpe(argv[0], argv, os.environ)
+    elif action == "execute":
         execute()
     elif action == "supervise":
         worker.supervise()

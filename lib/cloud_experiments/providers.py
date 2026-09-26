@@ -10,6 +10,7 @@ import time
 
 from .common import Error, command, managed_server, remote_path, require_managed, valid_result_path, valid_run
 from .progress import Activity, activity
+from .studies import STUDY_RE, attempt_study, state_head
 
 
 class Hetzner:
@@ -25,9 +26,10 @@ class Hetzner:
     def servers(self, rid=None):
         selector = "managed-by=cloud-experiments"
         if rid:
-            selector += ",run-id=" + valid_run(rid)
+            selector += (",study-id=" if STUDY_RE.fullmatch(rid) else ",run-id=") + valid_run(rid)
         result = json.loads(self.call("server", "list", "--selector", selector, "-o", "json").stdout)
-        return [s for s in result if managed_server(s, rid or s.get("labels", {}).get("run-id", "invalid"))]
+        return [s for s in result if managed_server(s, s.get("labels", {}).get("run-id", "invalid"))
+                and (rid is None or (s["labels"].get("study-id") if STUDY_RE.fullmatch(rid) else s["labels"].get("run-id")) == rid)]
 
     def find(self, rid):
         matches = self.servers(rid)
@@ -36,11 +38,13 @@ class Hetzner:
         return matches[0] if matches else None
 
     def create(self, manifest, user_data):
-        result = self.call("server", "create", "--name", manifest["run_id"],
+        study = manifest.get("study_id")
+        labels = ["--label", "study-id=" + study] if study else []
+        result = self.call("server", "create", "--name", study or manifest["run_id"],
                            "--type", manifest["machine"], "--location", manifest["location"],
                            "--image", "ubuntu-24.04", "--ssh-key", self.config["ssh_key"],
                            "--label", "managed-by=cloud-experiments", "--label", "run-id=" + manifest["run_id"],
-                           "--user-data-from-file", "-", "-o", "json", input=user_data.encode(), timeout=300)
+                           *labels, "--user-data-from-file", "-", "-o", "json", input=user_data.encode(), timeout=300)
         data = json.loads(result.stdout)
         server = data.get("server", data)
         require_managed(server, manifest["run_id"])
@@ -117,6 +121,8 @@ class Storage:
         return remote_path(self.storage, rid)
 
     def manifest(self, rid):
+        if STUDY_RE.fullmatch(rid):
+            return self.study_manifest(rid)
         result = json.loads(self.call("cat", self.path(rid) + "/manifest.json", timeout=90).stdout)
         if result.get("run_id") != rid or result.get("schema_version") != 1:
             raise Error("Remote manifest has an unexpected identity or schema version.")
@@ -146,7 +152,43 @@ class Storage:
         except (ValueError, UnicodeError, RecursionError):
             raise Error("Invalid EWS artifact JSON; use --path to inspect stored files.") from None
 
+    def studies(self):
+        bucket = self.path().removesuffix("/runs")
+        roots = json.loads(self.call("lsjson", bucket, "--dirs-only", timeout=120).stdout)
+        if not any(e.get("Name") == "studies" for e in roots):
+            return []
+        root = bucket + "/studies"
+        entries = json.loads(self.call("lsjson", root, "--dirs-only", timeout=120).stdout)
+        return [e["Name"] for e in entries if STUDY_RE.fullmatch(e.get("Name", ""))]
+
+    def study_state(self, study):
+        if study not in self.studies():
+            return None
+        files = self.files(study)
+        commits = [json.loads(self.call("cat", self.path(study) + "/" + e["path"], timeout=90).stdout)
+                   for e in files if e["path"].startswith("commits/") and e["path"].endswith(".json")]
+        return state_head(study, commits)
+
+    def study_manifest(self, study):
+        files = self.files(study)
+        attempts = []
+        for entry in files:
+            parts = entry["path"].split("/")
+            if len(parts) == 3 and parts[0] == "attempts" and parts[2] == "manifest.json" and attempt_study(parts[1]) == study:
+                attempts.append(self.manifest(parts[1]))
+        if not attempts:
+            raise Error("No stored attempts found for this study.")
+        latest = max(attempts, key=lambda m: (m["created_at"], m["run_id"]))
+        head = self.study_state(study)
+        return {**latest, "run_id": study, "study_id": study, "attempt_id": latest["run_id"],
+                "state": head, "attempts": [{k: m.get(k) for k in ("run_id", "status", "machine", "created_at", "finished_at", "ews")} for m in sorted(attempts, key=lambda m: (m["created_at"], m["run_id"]))]}
+
     def manifests(self):
+        for study in self.studies():
+            yield self.study_manifest(study)
+        roots = json.loads(self.call("lsjson", self.path().removesuffix("/runs"), "--dirs-only", timeout=120).stdout)
+        if not any(e.get("Name") == "runs" for e in roots):
+            return
         entries = json.loads(self.call("lsjson", self.path(), "--dirs-only", timeout=120).stdout)
         manifests, skipped = [], 0
         with Activity("Reading run manifests", delay=0.5) as progress:
@@ -169,6 +211,9 @@ class Storage:
     def pull(self, rid, destination):
         with Activity(f"Downloading {valid_run(rid)}"):
             self.call("copy", self.path(rid), str(destination))
+        if STUDY_RE.fullmatch(rid):
+            from .common import write_json
+            write_json(Path(destination) / "manifest.json", self.study_manifest(rid))
 
     def files(self, rid):
         """Read object names and sizes only, never file contents or hashes."""
@@ -213,7 +258,7 @@ class Storage:
                 self.call("copy", remote, str(destination), "--files-from-raw", str(selection), "--no-traverse")
 
     def file(self, rid, name, destination):
-        if name not in ("source/source.tar.gz", "source/index.json", "manifest.json"):
+        if name not in ("source/source.tar.gz", "source/index.json", "manifest.json", "machine/environment.json"):
             raise Error("Unsupported reproduction artifact.")
         with Activity("Downloading reproduction input"):
             self.call("copyto", self.path(rid) + "/" + name, str(destination))

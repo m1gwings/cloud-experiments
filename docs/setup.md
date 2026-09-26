@@ -22,7 +22,10 @@ Ubuntu 24.04 VMs.
 ## 2. Create the project and private bucket
 
 In Hetzner Console, create a Cloud project named **`experiments`**. Keep disposable
-research compute separate from other projects.
+research compute separate from other projects. One Cloud project must own each
+bucket study namespace: unique server names within that project provide the
+study writer lease. Do not use multiple Cloud projects to write the same namespace
+or rename/relabel managed workers.
 
 Create a **private** Object Storage bucket named **`migwings-experiments`** in
 **`nbg1`**. If that globally unique name is unavailable, choose your own and use
@@ -285,6 +288,14 @@ dirty source snapshot after changing your laptop checkout. Each new run is billa
 
 ## 10. Normal operation
 
+Read [automatic continuation](continuation.md). Repeat the same `cloud-run CONFIG`
+with the full EWS pin after a timeout/cancellation to restore and continue its
+persistent output. Machine/runtime may change. Use `--fresh` for a new lineage,
+then `--study STUDY_ID` to continue that specific lineage. Exact completed requests
+avoid compute. `cloud-results list --attempts STUDY_ID` shows history. The current
+EWS must support portable CPU/NumPy continuation; custom/GPU backends are rejected.
+
+
 Launch at night:
 
 ```bash
@@ -329,10 +340,12 @@ Re-run an old result from its stored source and pinned EWS commit:
 cloud-reproduce RUN_ID
 ```
 
-This creates a new billable VM with a new run ID. It preserves the old config,
+This creates a new independent study lineage and billable attempt, with no restored
+EWS output. It recreates the archived environment lock when available. It preserves the old config,
 dirty state, machine/location, runtime limit, and execution settings. Git changes
 since the original run do not affect its source. See the README for dependency
-and public-EWS-availability limitations.
+and public-EWS-availability limitations. This differs from ordinary repeated
+`cloud-run`, which restores the existing study output.
 
 ## 11. Cancellation and failure recovery
 
@@ -342,7 +355,8 @@ cloud-cancel RUN_ID --yes                 # explicit noninteractive confirmation
 cloud-cancel RUN_ID --force-delete --yes  # last resort: unsaved results may be lost
 ```
 
-Normal cancellation asks the worker to stop its process groups, collect partial
+Normal cancellation requests a safe EWS checkpoint, then bounded process-group
+termination, and collects complete partial
 data, upload, notify, and delete. It returns once that request is accepted; check
 status afterwards. Forced deletion verifies live management/run labels and the
 immutable server ID before issuing a delete. It may leave the remote manifest at

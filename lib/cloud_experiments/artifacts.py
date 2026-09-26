@@ -14,8 +14,15 @@ def artifact_selection(storage, rid, files, role):
     Multiple catalogs are ambiguous; refuse to guess which experiment was meant.
     Missing roles are unsupported/absent, while malformed catalogs are errors.
     """
+    from .studies import STUDY_RE
+    prefix = "artifacts/"
+    if STUDY_RE.fullmatch(rid):
+        head = storage.study_state(rid)
+        if head is None:
+            raise Error("This study has no verified EWS state yet; use ls and --path for attempt logs.")
+        prefix = "attempts/" + head["attempt_id"] + "/artifacts/"
     candidates = [entry for entry in files
-                  if entry["path"].startswith("artifacts/")
+                  if entry["path"].startswith(prefix)
                   and entry["path"].endswith("/" + INDEX_FILENAME)]
     if not candidates:
         raise Error("No EWS artifacts.json found (legacy run or metadata not uploaded). "

@@ -168,8 +168,12 @@ def managed_server(server, rid):
     if not isinstance(rid, str) or not RUN_RE.fullmatch(rid):
         return False
     labels = server.get("labels", {})
+    from .studies import attempt_study
+    study = attempt_study(rid)
+    expected_name = study or rid
     return (labels.get("managed-by") == MANAGED["managed-by"]
-            and labels.get("run-id") == rid and server.get("name") == rid
+            and labels.get("run-id") == rid and server.get("name") == expected_name
+            and (study is None or labels.get("study-id") == study)
             and isinstance(server.get("id"), int) and server["id"] > 0)
 
 
@@ -179,8 +183,17 @@ def require_managed(server, rid):
 
 
 def remote_path(storage, rid=None):
-    root = f"{storage['rclone_remote']}:{storage['bucket']}/runs"
-    return root if rid is None else f"{root}/{valid_run(rid)}"
+    from .studies import STUDY_RE, attempt_study
+    root = f"{storage['rclone_remote']}:{storage['bucket']}"
+    if rid is None:
+        return root + "/runs"
+    valid_run(rid)
+    if STUDY_RE.fullmatch(rid):
+        return root + "/studies/" + rid
+    study = attempt_study(rid)
+    if study:
+        return root + "/studies/" + study + "/attempts/" + rid
+    return root + "/runs/" + rid
 
 
 def redact(text, secrets):

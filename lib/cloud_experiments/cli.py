@@ -20,6 +20,7 @@ from .config import DEPENDENCIES, load, repository_url, run_settings, runtime_ho
 from .providers import Hetzner, SSH, Storage
 from .progress import Activity, human_bytes, interactive
 from .source import extract_snapshot, resolve_ref, snapshot
+from .studies import STUDY_RE, attempt_id, repository_identity, request_key, study_id
 
 
 def state(config, rid):
@@ -82,7 +83,10 @@ def launch(config, manifest, directory):
         ssh = ssh_for(config, server)
         ssh.wait()
         print("✓ VM ready (both deadline timers armed)")
-        ssh.upload([out / "source/source.tar.gz", out / "source/index.json"])
+        inputs = [out / "source/source.tar.gz", out / "source/index.json"]
+        if manifest.get("reproduction_environment_sha256"):
+            inputs.append(out / "machine/environment.json")
+        ssh.upload(inputs)
         print("✓ source uploaded")
         with Activity("Starting environment setup"):
             ssh.call(["systemctl", "start", "cloud-supervisor.service"])
@@ -162,6 +166,35 @@ def run_command(args, config):
     manifest = new_manifest(config, rid, experiment, config_path, source_sha,
                             index[config_path]["sha256"], {"repository": config["ews"]["repository"], "requested_ref": ref, "commit": commit},
                             machine=args.machine, hours=args.max_runtime, keep=args.keep_on_setup_failure)
+    sid = args.study or study_id(experiment["repository"], config_path, args.fresh)
+    if not STUDY_RE.fullmatch(sid):
+        raise Error("--study must identify a logical study returned by cloud-run.")
+    if config["run"]["command"] != ["ews", "run", "{config}", "--output", "{output}"]:
+        raise Error("Automatic continuation requires the standard EWS command; custom commands are not portable.")
+    manifest.update(study_id=sid, portable_continuation=True, name=args.name)
+    manifest["request_key"] = request_key(manifest, index)
+    active = Hetzner(config["hetzner"]).find(sid)
+    if active:
+        print(f"Study {sid} already has active attempt {active['labels']['run-id']}. Use cloud-attach {sid}.")
+        return
+    storage = Storage(config)
+    head = storage.study_state(sid)
+    if args.study and sid in storage.studies():
+        original = storage.study_manifest(sid)
+        if (repository_identity(original["experiment"]["repository"]) != repository_identity(experiment["repository"])
+                or original["config"]["path"] != config_path):
+            raise Error("--study belongs to a different repository/configuration path.")
+    if head and head.get("completed") is True and head.get("request_key") == manifest["request_key"]:
+        print(f"✓ Study already completed: {sid}\nNo compute created.")
+        return
+    if head:
+        print(f"✓ Found persisted study state: {sid}\n{head.get('counts', {}).get('completed', '?')} completed runs recorded; EWS will validate compatibility.")
+    rid = attempt_id(sid)
+    destination = Path(config["local"]["state_dir"]) / rid
+    directory.rename(destination)
+    directory = destination
+    manifest["run_id"] = rid
+    print(f"Study: {sid}\nAttempt: {rid}")
     launch(config, manifest, directory)
 
 
@@ -189,12 +222,16 @@ def reproduce_manifest(config, original, rid):
 def reproduce(args, config):
     storage = Storage(config)
     original = storage.manifest(valid_run(args.run_id))
-    rid = run_id(args.name or "reproduce")
+    original_id = original.get("attempt_id", original["run_id"])
+    if STUDY_RE.fullmatch(args.run_id):
+        original = storage.manifest(original_id)
+    sid = study_id(original["experiment"]["repository"], original["config"]["path"], fresh=True)
+    rid = attempt_id(sid)
     manifest = reproduce_manifest(config, original, rid)
     directory = state(config, rid)
     out = directory / "out"
     (out / "source").mkdir(parents=True)
-    storage.file(args.run_id, "source/source.tar.gz", out / "source/source.tar.gz")
+    storage.file(original_id, "source/source.tar.gz", out / "source/source.tar.gz")
     # Derive index and config from the checksummed immutable archive, never live Git.
     with Activity("Verifying and preparing reproduction"), tempfile.TemporaryDirectory(prefix="cloud-reproduce-") as temp:
         extract_snapshot(out / "source/source.tar.gz", temp, manifest["source"]["sha256"])
@@ -206,6 +243,16 @@ def reproduce(args, config):
         (out / "config").mkdir()
         shutil.copyfile(Path(temp) / name, out / "config/experiment-config")
         write_json(out / "source/index.json", index)
+    manifest.update(study_id=sid, portable_continuation=original.get("portable_continuation", bool(original.get("study_id"))), reproduces_run_id=original_id)
+    if any(entry["path"] == "machine/environment.json" for entry in storage.files(original_id)):
+        from .environment import decode
+        path = out / "machine/environment.json"
+        path.parent.mkdir()
+        storage.file(original_id, "machine/environment.json", path)
+        decode(path.read_bytes())
+        manifest["reproduction_environment_sha256"] = sha256(path)
+    manifest["request_key"] = request_key(manifest, index)
+    print(f"Independent reproduction study: {sid}")
     launch(config, manifest, directory)
 
 
@@ -223,12 +270,14 @@ def print_row(m, server=None):
         age = str(round((dt.datetime.now(dt.timezone.utc) - dt.datetime.fromisoformat(stamp.replace("Z", "+00:00"))).total_seconds() / 3600, 1)) + "h"
     except (TypeError, ValueError, AttributeError):
         age = "?"
-    print(f"{m['run_id']}\t{m.get('status', '?')}\t{m.get('machine', '?')}\t{m.get('config', {}).get('path', '?')}\t{age}\t{(server or {}).get('id', '-')}")
+    identity = m.get('study_id', m['run_id'])
+    attempt = m.get('attempt_id', m['run_id']) if m.get('study_id') else '-'
+    print(f"{identity}\t{m.get('status', '?')}\t{m.get('machine', '?')}\t{m.get('config', {}).get('path', '?')}\t{age}\t{(server or {}).get('id', '-')}\t{attempt}")
 
 
 def status(args, config):
     cloud, storage = Hetzner(config["hetzner"]), Storage(config)
-    print("RUN\tSTATUS\tMACHINE\tCONFIG\tAGE\tSERVER")
+    print("STUDY/RUN\tSTATUS\tMACHINE\tCONFIG\tAGE\tSERVER\tATTEMPT")
     if args.run_id:
         rid = valid_run(args.run_id)
         servers = [cloud.find(rid)]
@@ -259,7 +308,7 @@ def cancel(args, config):
         if not sys.stdin.isatty() or input(f"{'DELETE' if args.force_delete else 'Cancel'} {rid}? Type the run ID: ").strip() != rid:
             raise Error("Cancellation not confirmed. Use --yes for explicit noninteractive confirmation.")
     if args.force_delete:
-        cloud.delete(server, rid)
+        cloud.delete(server, server["labels"]["run-id"])
         print("VM deleted. The remote manifest may still show its previous status.")
     else:
         with Activity("Requesting cancellation and finalization"):
@@ -313,8 +362,14 @@ def pull_selection(storage, config, rid, selection=None, destination=None, *, ro
 def results(args, config):
     storage = Storage(config)
     if args.operation == "list":
-        print("RUN\tSTATUS\tMACHINE\tCONFIG\tAGE\tSERVER")
-        for manifest in storage.manifests():
+        print("STUDY/RUN\tSTATUS\tMACHINE\tCONFIG\tAGE\tSERVER\tATTEMPT")
+        manifests = storage.manifests()
+        if args.attempts:
+            if not STUDY_RE.fullmatch(args.attempts):
+                raise Error("--attempts requires a logical study ID.")
+            history = storage.study_manifest(args.attempts)["attempts"]
+            manifests = (storage.manifest(attempt["run_id"]) for attempt in history)
+        for manifest in manifests:
             print_row(manifest)
     elif args.operation == "ls":
         files = storage.files(valid_run(args.run_id))
@@ -362,6 +417,10 @@ def parser(name):
     p = argparse.ArgumentParser(prog=name)
     p.add_argument("--config", help="Local non-secret TOML configuration path")
     if name == "cloud-run":
+        p.description = "Continue a persistent EWS study with a disposable VM; unchanged completed requests create no compute."
+        lineage = p.add_mutually_exclusive_group()
+        lineage.add_argument("--fresh", action="store_true", help="Start an independent study lineage; use its returned --study ID to continue it")
+        lineage.add_argument("--study", help="Continue an explicit logical study (e.g. one created with --fresh)")
         p.add_argument("experiment_config")
         p.add_argument("--machine")
         p.add_argument("--ews-ref")
@@ -370,7 +429,9 @@ def parser(name):
         p.add_argument("--allow-dirty", action="store_true")
         p.add_argument("--keep-on-setup-failure", action="store_true")
     elif name in ("cloud-attach", "cloud-cancel", "cloud-reproduce"):
-        p.add_argument("run_id")
+        p.add_argument("run_id", help="Logical study ID, attempt ID, or legacy run ID")
+        if name == "cloud-reproduce":
+            p.description = "Create an independent study from archived source, EWS revision and available environment lock. Ordinary continuation uses cloud-run."
         if name == "cloud-cancel":
             p.add_argument("--yes", action="store_true")
             p.add_argument("--force-delete", action="store_true")
@@ -379,12 +440,13 @@ def parser(name):
     elif name == "cloud-status":
         p.add_argument("run_id", nargs="?")
     elif name == "cloud-results":
-        p.description = "Browse stored runs and download full archives or selected results."
+        p.description = "Browse persistent studies, individual attempts, and legacy runs; download full archives or semantic EWS artifacts."
         p.epilog = ("Examples: cloud-results ls RUN_ID; cloud-results pull RUN_ID --plots; "
                     "cloud-results pull RUN_ID --analysis; cloud-results pull RUN_ID --report; cloud-results pull RUN_ID --path RELATIVE_PATH. "
                     "Use pull --help for download options.")
         sub = p.add_subparsers(dest="operation", required=True)
-        sub.add_parser("list", help="List remote run manifests")
+        history = sub.add_parser("list", help="List logical studies and legacy runs, or one study's attempt history")
+        history.add_argument("--attempts", metavar="STUDY_ID", help="List every execution attempt for a logical study")
         listing = sub.add_parser("ls", help="Recursively list stored file paths and sizes without downloading",
                                  description="List all files recursively. Redirected stdout is headerless BYTES<TAB>PATH; activity uses stderr.")
         listing.add_argument("run_id")

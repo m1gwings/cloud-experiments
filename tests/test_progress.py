@@ -229,7 +229,11 @@ class TransferTests(unittest.TestCase):
             c = sample_config(tmp)
             storage = Storage(c)
             entries = [{"Name": "test-run"}, {"Name": "../bad"}, {"Name": "unreadable"}]
-            with patch.object(storage, "call", return_value=subprocess.CompletedProcess([], 0, json.dumps(entries).encode())), patch.object(storage, "manifest", side_effect=[sample_manifest(c), Error("secret")]), patch.object(Activity, "count") as count:
+            def listing(*args, **kwargs):
+                values = [{"Name": "runs"}] if args[1] == storage.path().removesuffix("/runs") else entries
+                return subprocess.CompletedProcess([], 0, json.dumps(values).encode())
+
+            with patch.object(storage, "call", side_effect=listing), patch.object(storage, "manifest", side_effect=[sample_manifest(c), Error("secret")]), patch.object(Activity, "count") as count:
                 manifests = list(storage.manifests())
             self.assertEqual(len(manifests), 1)
             self.assertEqual(count.call_count, 3)

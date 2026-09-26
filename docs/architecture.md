@@ -13,10 +13,14 @@ shared package in `lib/cloud_experiments` has no third-party Python dependencies
 | `artifacts.py` | Discover and validate EWS semantic catalogs; resolve role paths without internal layout mappings. |
 | `providers.py` | Structured hcloud/rclone arguments; quoted SSH; remote manifests. |
 | `bootstrap.py` | Compressed Python bundle and systemd units in cloud-init JSON/YAML. |
+| `studies.py` | Stable logical IDs, exact-request fingerprints and parent-linked state validation. |
+| `environment.py` | Safe exact environment capture, requirements and validation. |
+| `persistence.py` | Complete output inventories, verified restore and immutable publication. |
 | `worker.py` | Installation, PTY execution, supervision, finalization, direct API deletion. |
 
-The laptop makes no assumptions about EWS internals. The default argument
-array, optional webhook environment name, and versioned artifact catalog contract are EWS-specific. Paper-specific algorithms, instance generators, and
+The default EWS argument array, explicit portable CPU/NumPy policy, inspect counts,
+optional webhook environment name, and versioned artifact catalog contract are
+EWS-specific. Checkpoint decoding/selection is exclusively EWS-owned. Paper-specific algorithms, instance generators, and
 configuration belong in experiment repositories.
 
 ## Lifetime and ownership
@@ -31,8 +35,9 @@ configuration belong in experiment repositories.
    upload. Readiness requires both active timers. Boot-relative timers provide a
    second trigger if first boot initialization passed a deadline.
 4. Laptop transfers source/index and starts `cloud-supervisor.service`. The root
-   supervisor installs OS tools and an unprivileged Python environment. Source
-   and EWS checkout checks precede installation/execution.
+   supervisor installs OS tools, acquires/verifies its provider lease, restores the
+   complete verified EWS output and recreates the locked unprivileged environment.
+   Source, EWS checkout, runtime and package checks precede execution.
 5. A dedicated systemd cgroup runs the experiment's tmux server as `experiment`.
    `script` gives the command a PTY and captures stdout/stderr together. A file
    records the command exit code; the root supervisor watches it and the service.
@@ -44,7 +49,8 @@ configuration belong in experiment repositories.
    credential is root-owned mode 600 outside `/work`, and the original provider
    credential paths remain inaccessible to the experiment service.
 6. Completion, failure, cancellation, or a deadline starts a separate root
-   finalizer. It stops setup and experiment cgroups, collects workspace deltas,
+   finalizer. It stops setup, asks EWS to checkpoint through SIGINT with 90 seconds
+   grace, then stops the experiment cgroup. It collects complete EWS output and other workspace deltas,
    writes metadata, copies/checks payloads, then publishes/verifies the manifest.
    Upload errors get a bounded best-effort manifest-only retry.
 7. Optional Discord notification is bounded and cannot prevent deletion. A
@@ -55,7 +61,7 @@ configuration belong in experiment repositories.
 
 The direct API deletion path never trusts a requested server ID alone. It reads
 the VM's metadata identity and checks name, ID, and both labels against the live
-API resource. A 404 is idempotent success. The laptop similarly re-describes a
+API resource (study and attempt labels for modern workers). A 404 is idempotent success. The laptop similarly re-describes a
 known ID before deleting. Label drift intentionally causes refusal and requires
 manual investigation; safe targeting takes precedence over deleting an unknown VM.
 
@@ -102,10 +108,12 @@ pre-experiment baseline. Root credentials, cloud-init logs, and arbitrary system
 directories are never artifact inputs. Deletions/exclusions are explicit index
 entries. Terminal output is recorded as bytes rather than decoded/reformatted.
 
-Full dependency/environment bit-for-bit reproducibility is outside this first
-version: Ubuntu image packages and unpinned pip dependencies may change. Git
-source, config bytes, and EWS commit are fixed; environment details and pip freeze
-are recorded. User lockfiles can tighten this boundary.
+Study identity, atomic provider-name leases, append-only state publication,
+environment locking and compatibility are specified in [continuation.md](continuation.md).
+All workers for a bucket namespace must use one Hetzner project; deleted VMs
+release leases while still-existing failed VMs require explicit cleanup.
+Exact package/runtime locks are verified before portable EWS execution. This is
+not a bitwise OS-image or arbitrary native-library reproducibility guarantee.
 
 `run.ews_discord` is a boolean in the saved run settings, defaulting to false
 for legacy manifests. Reproduction preserves the original setting but supplies
@@ -124,7 +132,8 @@ retained; file bodies and hashes are not fetched. The default redirected output
 is headerless TSV, and `--json` provides structured records. Paths are validated
 before rendering to keep controls/traversal out of terminal output and downloads.
 
-Semantic pulls discover a unique `artifacts.json` under captured `artifacts/`
+Study semantic pulls select the authoritative committed attempt first.
+Attempt/legacy semantic pulls discover a unique `artifacts.json` under captured `artifacts/`
 using the listing. Its parent is the EWS output root, even for a custom command.
 The catalog discriminator is `experiments-wo-stress/artifacts`, version 1;
 `figures`, `analysis`, and `compute_report` map to CLI selectors. Bounded metadata
@@ -183,4 +192,5 @@ Uploads use [rclone check](https://rclone.org/commands/rclone_check/) for sizes 
 available remote hashes, followed by an exact manifest read-back. Source/config
 reproduction additionally verifies SHA-256 locally. EWS CLI defaults were checked
 against the local `experiments-wo-stress` README and `docs/CONFIGURATION.md` during
-implementation; different EWS versions may require a custom argument array.
+implementation. New continuation requires the standard command and portable EWS
+capability; legacy reproduction preserves its original command.
