@@ -14,10 +14,10 @@ import time
 
 from . import __version__
 from .bootstrap import render
-from .common import Error, FINAL, SHA_RE, read_json, run_id, sha256, utcnow, valid_run, write_json
+from .common import Error, FINAL, SHA_RE, read_json, run_id, sha256, utcnow, valid_result_path, valid_run, write_json
 from .config import DEPENDENCIES, load, repository_url, run_settings, runtime_hours, storage_credentials, worker_secrets
 from .providers import Hetzner, SSH, Storage
-from .progress import Activity
+from .progress import Activity, human_bytes, interactive
 from .source import extract_snapshot, resolve_ref, snapshot
 
 
@@ -278,14 +278,55 @@ def pull_run(storage, config, rid, destination=None):
     print(destination)
 
 
+def pull_selection(storage, config, rid, selection, destination=None, *, plots=False):
+    rid, selection = valid_run(rid), valid_result_path(selection)
+    files = storage.files(rid)
+    if not files:
+        raise Error("No stored files found for this run; check the run ID and storage configuration.")
+    paths = [entry["path"] for entry in files
+             if entry["path"] == selection or entry["path"].startswith(selection + "/")]
+    if not paths:
+        if plots:
+            print("No figures found under artifacts/output/analysis/figures/; nothing downloaded. "
+                  "This run may not have generated or uploaded figures.", file=sys.stderr)
+            return
+        raise Error("The selected path has no stored files; use cloud-results ls RUN_ID to inspect the run.")
+    destination = Path(destination).expanduser().absolute() if destination else Path(config["local"]["results_dir"]) / rid
+    storage.pull_paths(rid, destination, paths)
+    # A partial copy must never create or refresh the full-run sync marker.
+    print(f"Selective download complete: {rid} ({len(paths)} selected files)", file=sys.stderr, flush=True)
+    print(destination / selection)
+
+
 def results(args, config):
     storage = Storage(config)
     if args.operation == "list":
         print("RUN\tSTATUS\tMACHINE\tCONFIG\tAGE\tSERVER")
         for manifest in storage.manifests():
             print_row(manifest)
+    elif args.operation == "ls":
+        files = storage.files(valid_run(args.run_id))
+        if args.json:
+            print(json.dumps(files, ensure_ascii=True))
+        elif interactive():
+            print(f"{'SIZE':>12}  PATH")
+            for entry in files:
+                print(f"{human_bytes(entry['size']):>12}  {entry['path']}")
+        else:
+            for entry in files:
+                print(f"{entry['size']}\t{entry['path']}")
+        if not files:
+            print("No stored files found for this run; check the run ID and storage configuration.", file=sys.stderr)
     elif args.operation == "pull":
-        pull_run(storage, config, args.run_id, args.dest)
+        selection = args.path
+        if args.plots:
+            selection = "artifacts/output/analysis/figures"
+        elif args.analysis:
+            selection = "artifacts/output/analysis"
+        if selection is not None:
+            pull_selection(storage, config, args.run_id, selection, args.dest, plots=args.plots)
+        else:
+            pull_run(storage, config, args.run_id, args.dest)
     else:
         downloaded = skipped = 0
         for manifest in storage.manifests():
@@ -330,12 +371,25 @@ def parser(name):
     elif name == "cloud-status":
         p.add_argument("run_id", nargs="?")
     elif name == "cloud-results":
+        p.description = "Browse stored runs and download full archives or selected results."
+        p.epilog = ("Examples: cloud-results ls RUN_ID; cloud-results pull RUN_ID --plots; "
+                    "cloud-results pull RUN_ID --analysis; cloud-results pull RUN_ID --path RELATIVE_PATH. "
+                    "Use pull --help for download options.")
         sub = p.add_subparsers(dest="operation", required=True)
-        sub.add_parser("list")
-        pull = sub.add_parser("pull")
+        sub.add_parser("list", help="List remote run manifests")
+        listing = sub.add_parser("ls", help="Recursively list stored file paths and sizes without downloading",
+                                 description="List all files recursively. Redirected stdout is headerless BYTES<TAB>PATH; activity uses stderr.")
+        listing.add_argument("run_id")
+        listing.add_argument("--json", action="store_true", help="Output a JSON array of {path, size} records; size is bytes")
+        pull = sub.add_parser("pull", help="Download a full run or select --plots, --analysis or --path",
+                              description="Download a full run by default. Selectors preserve run-relative paths and never mark a run fully downloaded.")
         pull.add_argument("run_id")
-        pull.add_argument("--dest")
-        sub.add_parser("sync")
+        pull.add_argument("--dest", metavar="PATH", help="Local run root (default: configured results_dir/RUN_ID); also applies to selectors")
+        selectors = pull.add_mutually_exclusive_group()
+        selectors.add_argument("--plots", action="store_true", help="Fetch artifacts/output/analysis/figures/; succeed without downloading if absent")
+        selectors.add_argument("--analysis", action="store_true", help="Fetch artifacts/output/analysis/ (does not execute analysis)")
+        selectors.add_argument("--path", metavar="RELATIVE_PATH", help="Fetch one literal file or subtree inside the run, preserving its relative path")
+        sub.add_parser("sync", help="Download new/changed full runs; skip unchanged final archives")
     return p
 
 

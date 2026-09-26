@@ -117,6 +117,22 @@ option grants the research process webhook access, not Hetzner/S3 access.
 
 ## Verification
 
+Result browsing uses recursive `rclone lsjson --files-only --no-modtime
+--no-mimetype` at the validated run prefix. Only object paths and byte sizes are
+retained; file bodies and hashes are not fetched. The default redirected output
+is headerless TSV, and `--json` provides structured records. Paths are validated
+before rendering to keep controls/traversal out of terminal output and downloads.
+
+Selective pulls match an exact path or its `/`-delimited descendants against
+that listing. A private temporary `--files-from-raw` list drives `rclone copy`
+from the run root to the local run root; paths are literal, never filter globs.
+Destination symlinks and the reserved full-download marker are rejected before
+copying. Missing figures are a successful no-op only after an existing run's
+listing succeeds; missing generic paths and provider failures remain errors.
+Selective copies share the transfer progress adapter and never create/refresh
+`.cloud-pulled.json`. Full pulls still write that marker after success, and
+`sync` still downloads whole runs. No result command deletes remote objects.
+
 `python3 -m unittest discover -s tests -v` exercises real local Git snapshots with
 temporary directories and mocked provider effects. Synthetic tokens never leave
 the test process. Provider subprocess errors omit raw output and command
@@ -137,8 +153,10 @@ non-statistics records are never displayed. Capture-only commands (including
 manifest reads and provider JSON) keep the original subprocess path. Transfer
 timeouts and interruption kill/reap the process group before reporting failure.
 Tests exercise both pipe modes, malformed/oversized records, error privacy,
-interruption, download markers, and a real rclone copy/check between temporary
-local directories with an empty configuration; this never uses Object Storage.
+interruption, download markers, recursive listings, literal path selection,
+traversal rejection, and real rclone copy/check/selective retrieval between
+temporary local directories with an empty configuration; this never uses
+Object Storage.
 
 The provider adapter follows the official [hcloud create flags](https://github.com/hetznercloud/cli/blob/main/docs/reference/manual/hcloud_server_create.md)
 and [JSON/label-filtered list interface](https://github.com/hetznercloud/cli/blob/main/docs/reference/manual/hcloud_server_list.md).

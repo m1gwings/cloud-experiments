@@ -5,9 +5,10 @@ import json
 from pathlib import Path
 import shlex
 import sys
+import tempfile
 import time
 
-from .common import Error, command, managed_server, remote_path, require_managed, valid_run
+from .common import Error, command, managed_server, remote_path, require_managed, valid_result_path, valid_run
 from .progress import Activity, activity
 
 
@@ -99,7 +100,7 @@ class Storage:
         self.config_file = config["local"]["rclone_config"]
 
     def call(self, *args, timeout=1800):
-        label = {"cat": "Reading stored manifest", "lsjson": "Listing stored runs",
+        label = {"cat": "Reading stored manifest", "lsjson": "Listing stored files",
                  "copy": "Transferring files", "copyto": "Transferring stored file",
                  "check": "Verifying stored files"}.get(args[0], "Accessing storage")
         with Activity(label, delay=0.5 if args[0] in ("cat", "lsjson") else 0) as progress:
@@ -144,6 +145,48 @@ class Storage:
     def pull(self, rid, destination):
         with Activity(f"Downloading {valid_run(rid)}"):
             self.call("copy", self.path(rid), str(destination))
+
+    def files(self, rid):
+        """Read object names and sizes only, never file contents or hashes."""
+        raw = json.loads(self.call("lsjson", self.path(rid), "--recursive", "--files-only",
+                                   "--no-modtime", "--no-mimetype").stdout)
+        if not isinstance(raw, list):
+            raise Error("Invalid stored file listing.")
+        files, seen = [], set()
+        for entry in raw:
+            if (not isinstance(entry, dict) or entry.get("IsDir") is not False
+                    or type(entry.get("Size")) is not int or entry["Size"] < 0):
+                raise Error("Invalid stored file listing.")
+            path = valid_result_path(entry.get("Path"))
+            if path != entry["Path"] or path in seen:
+                raise Error("Invalid or duplicate stored file path.")
+            seen.add(path)
+            files.append({"path": path, "size": entry["Size"]})
+        return sorted(files, key=lambda entry: entry["path"])
+
+    def pull_paths(self, rid, destination, paths):
+        """Copy an exact list of objects, retaining their paths below the run root."""
+        remote = self.path(rid)
+        destination = Path(destination).expanduser().absolute()
+        paths = [valid_result_path(path) for path in paths]
+        if not paths:
+            return
+        for path in paths:
+            if path.split("/", 1)[0] in (".cloud-pulled.json", ".cloud-pulled.json.tmp"):
+                raise Error("Refusing to overwrite the local full-download marker.")
+            local = destination
+            for part in path.split("/"):
+                local = local / part
+                if local.is_symlink():
+                    raise Error("Selected destination contains a symlink; choose a different --dest.")
+        destination.mkdir(parents=True, exist_ok=True)
+        # Raw names are literal, including spaces, # and glob characters. Never
+        # build rclone filters from user input or put paths into a shell command.
+        with tempfile.TemporaryDirectory(prefix="cloud-results-") as tmp:
+            selection = Path(tmp) / "files"
+            selection.write_text("".join(path + "\n" for path in paths), encoding="utf-8")
+            with Activity(f"Downloading selected files for {valid_run(rid)}"):
+                self.call("copy", remote, str(destination), "--files-from-raw", str(selection), "--no-traverse")
 
     def file(self, rid, name, destination):
         if name not in ("source/source.tar.gz", "source/index.json", "manifest.json"):

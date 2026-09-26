@@ -301,13 +301,25 @@ The next morning:
 
 ```bash
 cloud-results list
+cloud-results ls RUN_ID
+cloud-results pull RUN_ID --plots
+# Or fetch saved analysis / a specific report:
+cloud-results pull RUN_ID --analysis
+cloud-results pull RUN_ID --path artifacts/output/compute/summary.md
+# For the complete archival bundle:
 cloud-results pull RUN_ID
 # or incrementally retrieve all runs:
 cloud-results sync
 ```
 
 For a custom destination, `cloud-results pull RUN_ID --dest /path/to/run-results`.
-Full artifacts are downloaded; no analysis code is executed automatically.
+Selectors also accept `--dest`: it is the run root, with the remote-relative
+subtree preserved below it. `ls` reads names/sizes only; `--plots` succeeds with
+an explanation when an existing run has no figures. Plain `pull` and `sync`
+download full runs; no analysis code is executed automatically. See the
+[README's remote inspection and selective download reference](../README.md#inspect-remote-results-and-download-selected-files)
+for exact paths, output formats, and validation rules. Check the current checkout
+revision and `cloud-results --help` / `cloud-results pull --help` after updating.
 
 Re-run an old result from its stored source and pinned EWS commit:
 

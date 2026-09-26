@@ -16,7 +16,9 @@ cloud-attach RUN_ID                 # detach with Ctrl-b, then d
 
 # Later, after the worker has uploaded results and deleted itself:
 cloud-results list
-cloud-results pull RUN_ID
+cloud-results ls RUN_ID             # inspect remote files and sizes
+cloud-results pull RUN_ID --plots   # fetch just figures for inspection
+cloud-results pull RUN_ID           # retain a complete reproducibility bundle
 ```
 
 Start with [the complete setup guide](docs/setup.md). The supplied
@@ -31,8 +33,12 @@ project, `nbg1`, and `migwings-experiments` bucket described there.
 | `cloud-attach RUN_ID` | Attach to the active experiment's tmux terminal. |
 | `cloud-status [RUN_ID]` | Show managed active VMs, or a stored manifest for a completed run. |
 | `cloud-results list` | Read remote manifests, including failed and incomplete runs. |
+| `cloud-results ls RUN_ID [--json]` | Recursively list remote file paths and sizes without downloading contents. |
 | `cloud-results pull RUN_ID [--dest PATH]` | Download the full run, by default to `~/cloud-results/RUN_ID`. |
-| `cloud-results sync` | Retrieve new/changed runs; skip final manifests already downloaded. |
+| `cloud-results pull RUN_ID --plots` | Download only `artifacts/output/analysis/figures/`; succeed with an explanation if absent. |
+| `cloud-results pull RUN_ID --analysis` | Download `artifacts/output/analysis/`, including figures; does not execute analysis. |
+| `cloud-results pull RUN_ID --path RELATIVE_PATH` | Download one literal file or subtree, preserving its run-relative path. |
+| `cloud-results sync` | Retrieve new/changed full runs; skip final manifests already fully downloaded. |
 | `cloud-cancel RUN_ID [--yes]` | Ask the worker to stop, upload partial results, and delete itself. |
 | `cloud-cancel RUN_ID --force-delete [--yes]` | Delete an unreachable managed VM; unsaved results can be lost. |
 | `cloud-reproduce RUN_ID [--name NAME]` | Launch a new run from stored input and pinned settings. |
@@ -73,11 +79,13 @@ color. Fast metadata lookups stay quiet unless they fail. Tables and downloaded
 paths remain on stdout for scripts. `cloud-results sync` ends with downloaded
 and unchanged counts, including when there is nothing to download.
 
-Only numeric rclone statistics are displayed: raw subprocess logs, filenames,
-URLs and credential-bearing messages stay captured and are never streamed to
-the terminal. Failed commands still return nonzero status with safe error
+Progress displays use only numeric rclone statistics: raw subprocess logs,
+filenames, URLs and credential-bearing messages stay captured and are never
+streamed by the progress display. Failed commands still return nonzero status with safe error
 messages. Ctrl-C stops an active transfer; rerunning `pull` uses rclone's
-incremental copy behavior. A download marker is written only after success.
+incremental copy behavior. A full-download marker is written only after a
+successful full pull; selective pulls never create or refresh it. Explicit
+`ls` output includes validated file names and sizes; progress displays do not.
 Cancelling a run reports that finalization was **requested**, not that uploads
 or VM deletion have already finished; check `cloud-status` afterwards.
 
@@ -217,8 +225,83 @@ destructive rclone sync operations are used for result retrieval.
 `cloud-results sync` compares remote final manifests to local download markers;
 running runs are refreshed using rclone's incremental copy behavior. Remove a
 run's `.cloud-pulled.json` marker, or use `pull`, to restore deleted local files.
-There is intentionally no automatic `--analysis` execution: a pull never executes
-downloaded research code.
+A pull never executes downloaded research code; `--analysis` selects stored files
+only. Selective downloads do not mark a run fully downloaded, so a later `sync`
+still retrieves its full archive.
+
+## Inspect remote results and download selected files
+
+Use `list` to find run IDs, then `ls` to inspect the files inside one run:
+
+```bash
+cloud-results list
+cloud-results ls RUN_ID
+cloud-results ls RUN_ID --json
+```
+
+`ls` recursively reads names and sizes from Object Storage, without downloading
+file contents, creating local result directories, or contacting a VM. Paths are
+relative to the run root and sorted by path. Interactive output has a size/path
+table with human-readable sizes. Redirected output is headerless TSV,
+`BYTES<TAB>PATH`, with integer byte counts; `--json` always emits an array of
+`{"path": "...", "size": 123}` records. Activity and empty-list explanations go
+to stderr. An empty listing means no stored files were found at that run prefix;
+check the run ID and storage configuration. Storage/access errors return nonzero.
+
+For a quick look at plots or analysis, download just the relevant subtree:
+
+```bash
+cloud-results pull RUN_ID --plots
+cloud-results pull RUN_ID --analysis
+cloud-results pull RUN_ID --path artifacts/output/compute/summary.md
+cloud-results pull RUN_ID --path logs
+cloud-results pull RUN_ID --path manifest.json
+```
+
+`--plots` selects `artifacts/output/analysis/figures/`; `--analysis` selects
+`artifacts/output/analysis/`, including figures and any other saved analysis
+exports. These are the default EWS output locations. For a custom output layout,
+use `ls` followed by `--path`. Selectors are mutually exclusive. `--path` matches
+one exact file or a directory and all descendants, not a glob or a partial name.
+Quote paths containing spaces or shell metacharacters. One trailing `/` is
+accepted; absolute paths, `.`/`..` components, repeated `/`, backslashes, colons,
+and control characters are rejected before storage access. Stored paths are
+validated too; the local full-download marker cannot be selected or overwritten.
+Existing symlinks within a selected local subtree are rejected.
+
+All selectors preserve the remote-relative tree inside the local run root:
+
+```text
+--plots                         -> ~/cloud-results/RUN_ID/artifacts/output/analysis/figures/
+--analysis                      -> ~/cloud-results/RUN_ID/artifacts/output/analysis/
+--path logs                     -> ~/cloud-results/RUN_ID/logs/
+--path manifest.json            -> ~/cloud-results/RUN_ID/manifest.json
+```
+
+The configured `local.results_dir` replaces `~/cloud-results`. `--dest` sets the
+local **run root**, including for selective pulls:
+
+```bash
+cloud-results pull RUN_ID --plots --dest /path/to/run-results
+# Figures land in /path/to/run-results/artifacts/output/analysis/figures/
+```
+
+A successful selective pull prints the selected local file/directory path on
+stdout and a completion message on stderr. It lists metadata first, copies only
+matching objects, and uses the same interactive progress/plain output as a full
+pull. Repeating it copies new/changed files without deleting local extras. If an
+existing run has no figures, `--plots` exits successfully, explains that nothing
+was downloaded, and prints no destination. Missing generic paths/analysis,
+unknown or empty runs, and storage errors fail clearly. A selector does not run
+analysis or create figures; a run without configured/generated/uploaded figures
+will still have none after a pull.
+
+For archival and reproduction, use plain `cloud-results pull RUN_ID` to keep the
+complete source/config/manifest/log/artifact bundle. `cloud-results sync` retains
+full-run semantics and accepts no selectors. A partial download alone is not a
+complete archive. These commands never modify or delete remote objects.
+
+## Reproduce a stored run
 
 `cloud-reproduce` verifies the stored tarball and config checksums and reuses its
 exact source, EWS commit, machine, location, command, artifact policy, and runtime

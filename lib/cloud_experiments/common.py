@@ -37,6 +37,19 @@ def valid_run(value):
     return value
 
 
+def valid_result_path(value):
+    """A literal run-relative path; permit one trailing slash for directories."""
+    message = ("Invalid result path: use a nonempty relative path with / separators; "
+               "absolute paths, ., .., empty components, backslashes, colons and control characters are not allowed.")
+    if (not isinstance(value, str) or not value or "\\" in value or ":" in value
+            or any(not char.isprintable() for char in value)):
+        raise Error(message)
+    value = value.removesuffix("/")
+    if any(part in ("", ".", "..") for part in value.split("/")):
+        raise Error(message)
+    return value
+
+
 def sha256(path):
     h = hashlib.sha256()
     with Path(path).open("rb") as f:
