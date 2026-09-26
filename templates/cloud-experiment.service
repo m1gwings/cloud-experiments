@@ -1,0 +1,20 @@
+[Unit]
+Description=Unprivileged experiment terminal
+
+[Service]
+Type=forking
+User=experiment
+Group=experiment
+Environment=HOME=/work/home
+WorkingDirectory=/work/source
+ExecStart=/usr/bin/tmux -L cloud-experiments new-session -d -s experiment "@ENTRY@ execute"
+TimeoutStopSec=20
+KillMode=control-group
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/work /tmp
+ProtectHome=yes
+PrivateDevices=yes
+RestrictSUIDSGID=yes
+InaccessiblePaths=/opt/cloud-experiments/credentials.json /opt/cloud-experiments/rclone.conf /var/lib/cloud

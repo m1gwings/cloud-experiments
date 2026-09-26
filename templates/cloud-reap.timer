@@ -1,0 +1,12 @@
+[Unit]
+Description=Independent last-resort compute deletion
+
+[Timer]
+OnCalendar=@REAP@
+OnBootSec=@REAP_SECONDS@s
+Persistent=true
+AccuracySec=1s
+Unit=cloud-delete.service
+
+[Install]
+WantedBy=timers.target

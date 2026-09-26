@@ -1,0 +1,11 @@
+[Unit]
+Description=Preserve experiment results then destroy compute
+After=network-online.target
+OnFailure=cloud-delete.service
+
+[Service]
+Type=oneshot
+ExecStart=@ENTRY@ finalize
+TimeoutStartSec=12min
+TimeoutStopSec=10
+UMask=0077

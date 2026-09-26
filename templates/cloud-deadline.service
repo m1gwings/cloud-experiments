@@ -1,0 +1,8 @@
+[Unit]
+Description=Stop and finalize an expired cloud experiment
+OnFailure=cloud-delete.service
+
+[Service]
+Type=oneshot
+ExecStart=@ENTRY@ timeout
+TimeoutStartSec=45

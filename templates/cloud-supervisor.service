@@ -1,0 +1,14 @@
+[Unit]
+Description=Cloud experiment setup and supervision
+After=network-online.target
+Wants=network-online.target
+OnFailure=cloud-finalize.service
+
+[Service]
+Type=simple
+ExecStart=@ENTRY@ supervise
+TimeoutStopSec=20
+KillMode=control-group
+UMask=0077
+StandardOutput=journal
+StandardError=journal

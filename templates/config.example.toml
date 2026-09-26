@@ -1,0 +1,29 @@
+[hetzner]
+context = "experiments"
+location = "nbg1"
+ssh_key = "migwings-ideapad"
+default_server_type = "cpx32"
+heavy_server_type = "cpx52"
+max_runtime_hours = 24
+
+[storage]
+rclone_remote = "hetzner"
+bucket = "migwings-experiments"
+
+[ews]
+repository = "https://github.com/m1gwings/experiments-wo-stress.git"
+default_ref = "main"
+
+# Optional. Commands are argument arrays, never shell snippets.
+[run]
+command = ["ews", "run", "{config}", "--output", "{output}"]
+install_experiment = "auto" # requirements.txt, then editable project if present
+artifact_exclude = [] # globs relative to /work; recorded in every manifest
+
+# All paths support ~. XDG_CONFIG_HOME and XDG_STATE_HOME are honored by defaults.
+# [local]
+# state_dir = "~/.local/state/cloud-experiments"
+# results_dir = "~/cloud-results"
+# worker_env = "~/.config/cloud-experiments/worker.env"
+# rclone_config = "~/.config/rclone/rclone.conf"
+# ssh_identity = "~/.ssh/id_ed25519"

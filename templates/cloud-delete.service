@@ -1,0 +1,13 @@
+[Unit]
+Description=Delete only this labeled VM, retry until Hetzner accepts deletion
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+ExecStart=@ENTRY@ delete
+Restart=on-failure
+RestartSec=30s
+TimeoutStartSec=90s
+UMask=0077

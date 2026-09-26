@@ -1,0 +1,12 @@
+[Unit]
+Description=Absolute experiment deadline (survives reboot)
+
+[Timer]
+OnCalendar=@DEADLINE@
+OnBootSec=@MAX_SECONDS@s
+Persistent=true
+AccuracySec=1s
+Unit=cloud-deadline.service
+
+[Install]
+WantedBy=timers.target
