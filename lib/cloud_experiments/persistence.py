@@ -106,7 +106,7 @@ def download_files(call, root, recovery, destination, paths):
         selection.write_text("".join(digest + "\n" for digest in sorted(digests)))
         pool = temporary / "blobs"
         call("copy", root + "/blobs", str(pool), "--files-from", str(selection),
-             "--no-traverse", "--transfers", "16", timeout=1800)
+             "--no-traverse", "--transfers", "16", timeout=7200)
         for digest, size in digests.items():
             blob = pool / digest
             if blob.is_symlink() or not blob.is_file() or blob.stat().st_size != size or sha256(blob) != digest:

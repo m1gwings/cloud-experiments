@@ -92,8 +92,8 @@ def launch(config, manifest, directory):
         print("✓ source uploaded")
         with Activity("Starting environment setup"):
             ssh.call(["systemctl", "start", "cloud-supervisor.service"])
-        with Activity("Installing environment and waiting for launch"):
-            until = time.monotonic() + min(2400, manifest["max_runtime_hours"] * 3600)
+        with Activity("Installing environment and restoring saved progress"):
+            until = time.monotonic() + min(10800, manifest["max_runtime_hours"] * 3600)
             while time.monotonic() < until:
                 try:
                     result = ssh.call(["test", "-f", "/opt/cloud-experiments/started"], check=False, timeout=20)
