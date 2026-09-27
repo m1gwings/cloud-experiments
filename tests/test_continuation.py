@@ -1,6 +1,5 @@
 """Logical studies, environment locks, provider leases and filesystem restore: offline only."""
 
-import base64
 import contextlib
 import io
 import json
@@ -9,14 +8,15 @@ from pathlib import Path
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
 from unittest.mock import Mock, patch
 import zipfile
 
-from test_core import sample_config, sample_manifest, server
-from cloud_experiments import bootstrap, cli, environment, persistence, studies, worker
+from test_core import decode_cloud_file, sample_config, sample_manifest, server
+from cloud_experiments import bootstrap, cli, environment, ews_contract, persistence, studies, worker
 from cloud_experiments.common import Error, managed_server, read_json, remote_path, sha256, write_json
 from cloud_experiments.providers import Hetzner, Storage
 
@@ -31,6 +31,7 @@ def env_lock():
 
 def study_manifest(config, study=None):
     m = sample_manifest(config)
+    m['ews']['cloud_contract'] = dict(ews_contract.CONTRACT)
     sid = study or studies.study_id(m["experiment"]["repository"], m["config"]["path"])
     m.update(study_id=sid, run_id=studies.attempt_id(sid), request_key="e" * 64)
     return m
@@ -49,6 +50,8 @@ class IdentityTests(unittest.TestCase):
         original = studies.request_key(m, {"source": "bytes"})
         m.update(machine="cpx52", max_runtime_hours=6)
         self.assertEqual(studies.request_key(m, {"source": "bytes"}), original)
+        m["settings"].update(sync_seconds=60, timezone="Europe/Rome", ews_discord=True)
+        self.assertEqual(studies.request_key(m, {"source": "bytes"}), original)
         self.assertNotEqual(studies.request_key(m, {"source": "changed"}), original)
         m["ews"]["commit"] = "f" * 40
         self.assertNotEqual(studies.request_key(m, {"source": "bytes"}), original)
@@ -66,10 +69,10 @@ class IdentityTests(unittest.TestCase):
             return dict(schema_version=1, study_id=sid, attempt_id=studies.attempt_id(sid), parent=parent, inventory_sha256='a'*64)
         a = commit()
         b = commit(a['attempt_id'])
-        self.assertEqual(studies.state_head(sid, [b, a]), b)
+        self.assertEqual(studies.state_head(sid, [b, a], allow_legacy=True), b)
         for records in ([a, b, commit(a['attempt_id'])], [b], [a, commit()], [a, a]):
             with self.subTest(records=records), self.assertRaises(Error):
-                studies.state_head(sid, records)
+                studies.state_head(sid, records, allow_legacy=True)
 
 
 class EnvironmentTests(unittest.TestCase):
@@ -135,7 +138,9 @@ class RunCommandTests(unittest.TestCase):
         self.stack = contextlib.ExitStack()
         self.addCleanup(self.stack.close)
         self.stack.enter_context(patch('cloud_experiments.source.git', return_value=str(self.repo)))
-        self.stack.enter_context(patch('cloud_experiments.cli.resolve_ref', return_value='c'*40))
+        self.stack.enter_context(patch('cloud_experiments.cli.resolve_ews', return_value={
+            'repository': self.config['ews']['repository'], 'requested_ref': 'main', 'commit': 'c'*40,
+            'cloud_contract': dict(ews_contract.CONTRACT)}))
         def snapshot(cwd, arg, dest, dirty):
             dest.write_bytes(b'archive')
             (dest.parent/'experiment-config').write_text('seed: 1')
@@ -155,7 +160,8 @@ class RunCommandTests(unittest.TestCase):
 
     def test_repeated_source_with_changed_machine_runtime_restores_same_study(self):
         first = self.run_command('--machine', 'cpx32', '--max-runtime', '2')
-        self.storage.study_state.return_value = {'completed': False, 'attempt_id': first['run_id'], 'counts': {'completed': 83}}
+        self.storage.study_state.return_value = {'completed': False, 'attempt_id': first['run_id'],
+            'counts': {'completed': 83}, 'contract': dict(ews_contract.CONTRACT)}
         second = self.run_command('--machine', 'cpx52', '--max-runtime', '6')
         self.assertEqual(first['study_id'], second['study_id'])
         self.assertEqual(first['request_key'], second['request_key'])
@@ -164,7 +170,8 @@ class RunCommandTests(unittest.TestCase):
 
     def test_exact_completed_request_avoids_compute_but_changed_source_launches(self):
         first = self.run_command()
-        self.storage.study_state.return_value = {'completed': True, 'request_key': first['request_key'], 'counts': {'completed': 9}}
+        self.storage.study_state.return_value = {'completed': True, 'request_key': first['request_key'],
+            'counts': {'completed': 9}, 'contract': dict(ews_contract.CONTRACT)}
         self.launch.reset_mock()
         self.run_command('--machine', 'cpx52')
         self.launch.assert_not_called()
@@ -251,6 +258,14 @@ class StateRoundTripTests(unittest.TestCase):
         self.m = study_manifest(self.config)
         self.m.update(status='timeout', exit_code=None, parent_state=None)
         self.w = self.make_worker('first', self.m)
+        self.w.upload(self.m)  # Laptop preflight creates the study prefix before VM setup.
+        from test_recovery import sealed_snapshot
+        create = patch.object(persistence.ews_contract, 'create_snapshot', side_effect=lambda w, src, dst: sealed_snapshot(src, dst))
+        create.start()
+        self.addCleanup(create.stop)
+        restore = patch.object(persistence.ews_contract, 'restore_snapshot', side_effect=lambda w, src, dst: shutil.copytree(Path(src)/'output', dst))
+        restore.start()
+        self.addCleanup(restore.stop)
 
     def call(self, *args, **kwargs):
         prefix = 'test:test-bucket'
@@ -281,10 +296,9 @@ class StateRoundTripTests(unittest.TestCase):
         (output / 'renamed-charts/figure.pdf').write_bytes(b'plot')
         write_json(self.w.base / 'environment-ready.json', env_lock())
         self.m.update(status=status)
-        persistence.collect_state(self.w, self.m)
+        persistence.sync(self.w, self.m, final=True)
         self.w.save(self.m)
         self.w.upload(self.m, final=True)
-        persistence.publish_state(self.w, self.m)
 
     def test_timeout_and_cancellation_restore_complete_checkpoints_on_next_machine(self):
         self.persist('timeout')
@@ -293,26 +307,25 @@ class StateRoundTripTests(unittest.TestCase):
         next_m['max_runtime_hours'] = 6
         second = self.make_worker('second', next_m)
         persistence.restore(second, next_m)
-        self.assertEqual(persistence.inventory(second.work/'output'), persistence.inventory(self.w.work/'output'))
-        self.assertEqual(next_m['parent_state'], self.m['run_id'])
+        self.assertEqual((second.work/'output/runs/run/checkpoints/one/arrays.npz').read_bytes(), b'exact-binary-checkpoint')
+        self.assertEqual(next_m['parent_state'], self.m['last_recovery']['commit_id'])
         next_m.update(status='cancelled', exit_code=None)
         write_json(second.base/'environment-ready.json', env_lock())
-        persistence.collect_state(second, next_m)
+        persistence.sync(second, next_m, final=True)
         second.save(next_m)
         second.upload(next_m, final=True)
-        persistence.publish_state(second, next_m)
         head, _ = persistence.read_head(second, next_m)
         self.assertEqual(head['attempt_id'], next_m['run_id'])
         self.assertFalse(head['completed'])
         third_m = study_manifest(self.config, self.m['study_id'])
         third = self.make_worker('third', third_m)
         persistence.restore(third, third_m)
-        self.assertEqual(persistence.inventory(third.work/'output'), persistence.inventory(second.work/'output'))
+        self.assertEqual((third.work/'output/runs/run/checkpoints/one/arrays.npz').read_bytes(), b'exact-binary-checkpoint')
 
     def test_corrupt_restored_bytes_are_rejected_before_execution(self):
         self.persist()
-        source = self.remote/'studies'/self.m['study_id']/'attempts'/self.m['run_id']/'artifacts/output'
-        (source/'runs/run/checkpoints/one/arrays.npz').write_bytes(b'corrupt')
+        source = self.remote/'studies'/self.m['study_id']/'blobs'
+        (source/sha256(self.w.work/'output/runs/run/checkpoints/one/arrays.npz')).write_bytes(b'corrupt')
         m = study_manifest(self.config, self.m['study_id'])
         w = self.make_worker('bad', m)
         with self.assertRaisesRegex(Error, 'SHA-256'):
@@ -352,8 +365,8 @@ class StateRoundTripTests(unittest.TestCase):
             self.w.seal_environment(self.m, None)
         self.assertFalse((self.w.base/'environment-ready.json').exists())
         write_json(self.w.work/'output/metadata.json', {})
-        persistence.collect_state(self.w, self.m)
-        self.assertNotIn('state_inventory_sha256', self.m)
+        self.assertIsNone(persistence.prepare(self.w, self.m))
+        self.assertNotIn('last_recovery', self.m)
 
     def test_only_successful_complete_ews_request_can_publish_completed_shortcut(self):
         self.m.update(exit_code=0, ews_counts=dict(completed=9, pending=0, running=0, paused=0, failed=0, corrupt=0))
@@ -362,20 +375,22 @@ class StateRoundTripTests(unittest.TestCase):
         self.assertTrue(head['completed'])
         history = Storage(self.config)
         history.call = self.call
-        with patch('cloud_experiments.cli.Storage', return_value=history), contextlib.redirect_stdout(io.StringIO()) as out:
+        with patch('cloud_experiments.cli.Storage', return_value=history), patch('cloud_experiments.cli.Hetzner') as cloud, contextlib.redirect_stdout(io.StringIO()) as out:
+            cloud.return_value.servers.return_value = []
             cli.results(cli.parser('cloud-results').parse_args(['list', '--attempts', self.m['study_id']]), self.config)
         self.assertIn(self.m['run_id'], out.getvalue())
 
     def test_secret_like_and_linked_state_cannot_be_silently_excluded(self):
         output = self.w.work/'output'
+        write_json(self.w.base/'environment-ready.json', env_lock())
         linked = output/'linked'
         linked.symlink_to(self.empty)
         with self.assertRaises(Error):
-            persistence.inventory(output)
+            persistence.prepare(self.w, self.m)
         linked.unlink()
         (output/'.env').write_text('FAKE_SECRET=never-upload')
         with self.assertRaises(Error):
-            persistence.inventory(output)
+            persistence.prepare(self.w, self.m)
 
     def test_reproduce_uses_archived_lock_and_independent_output_lineage(self):
         import tarfile
@@ -391,7 +406,7 @@ class StateRoundTripTests(unittest.TestCase):
         self.persist()
         storage = Storage(self.config)
         storage.call = self.call
-        with patch('cloud_experiments.cli.Storage', return_value=storage), patch('cloud_experiments.cli.launch') as launch, contextlib.redirect_stdout(io.StringIO()):
+        with patch('cloud_experiments.cli.Storage', return_value=storage), patch('cloud_experiments.cli.resolve_ews', return_value=self.m['ews']), patch('cloud_experiments.cli.launch') as launch, contextlib.redirect_stdout(io.StringIO()):
             cli.reproduce(cli.parser('cloud-reproduce').parse_args([self.m['study_id']]), self.config)
         new = launch.call_args.args[1]
         self.assertNotEqual(new['study_id'], self.m['study_id'])
@@ -439,6 +454,10 @@ class WorkerSetupTests(unittest.TestCase):
         self.addCleanup(stack.close)
         stack.enter_context(patch('cloud_experiments.worker.own_server_id', return_value=123))
         stack.enter_context(patch('cloud_experiments.worker.notify'))
+        self.head = stack.enter_context(patch('cloud_experiments.persistence.read_head', return_value=(None, env_lock())))
+        self.query = stack.enter_context(patch('cloud_experiments.ews_contract.query', return_value=ews_contract.CONTRACT))
+        self.options = stack.enter_context(patch('cloud_experiments.ews_contract.runtime_options', return_value={
+            'workers': 16, 'timezone': 'Europe/Rome', 'mode': 'cpu'}))
         self.restore = stack.enter_context(patch('cloud_experiments.persistence.restore', return_value=env_lock()))
         self.capture = stack.enter_context(patch.object(self.w, 'capture_environment', return_value=env_lock()))
         stack.enter_context(patch.object(self.w, 'verify_lease'))
@@ -453,11 +472,15 @@ class WorkerSetupTests(unittest.TestCase):
     def test_locked_setup_pins_packages_then_verifies_environment_before_ews(self):
         self.w.supervise()
         self.restore.assert_called_once()
-        self.assertEqual(self.capture.call_count, 2)  # Runtime before install, full lock afterward.
+        self.assertEqual(self.capture.call_count, 3)  # Before install, sealed lock, verified restored lock.
         installs = [a for a in self.commands if 'pip' in a and 'install' in a]
         self.assertTrue(all('--constraint' in a for a in installs))
         self.assertIn('--only-binary=:all:', installs[0])
-        self.assertEqual(read_json(self.work/'runtime/command.json')[-1], '--portable')
+        command = read_json(self.work/'runtime/command.json')
+        self.assertIn('--portable', command)
+        self.assertEqual(command[-2:], ['--workers', '16'])
+        self.query.assert_called_once_with(self.w, ews_contract.CONTRACT)
+        self.assertEqual(self.w.manifest()['runtime']['workers'], 16)
         self.assertEqual(read_json(self.base/'reason.json')['status'], 'completed')
         self.assertTrue((self.base/'environment-ready.json').exists())
 
@@ -478,6 +501,22 @@ class WorkerSetupTests(unittest.TestCase):
         self.w.supervise()
         self.assertEqual(read_json(self.base/'reason.json')['status'], 'setup_failed')
         self.assertFalse((self.base/'started').exists())
+
+    def test_unsupported_installed_contract_never_seals_or_restores_state(self):
+        self.query.side_effect = Error('Unsupported EWS cloud recovery contract')
+        self.w.supervise()
+        self.assertEqual(read_json(self.base/'reason.json')['status'], 'setup_failed')
+        self.assertFalse((self.base/'environment-ready.json').exists())
+        self.restore.assert_not_called()
+        self.assertFalse((self.base/'started').exists())
+
+    def test_timezone_is_forwarded_in_command_without_editing_scientific_yaml(self):
+        self.m['settings']['timezone'] = 'Europe/Rome'
+        self.w.save(self.m)
+        self.w.supervise()
+        command = read_json(self.work/'runtime/command.json')
+        self.assertEqual(command[-4:], ['--workers', '16', '--timezone', 'Europe/Rome'])
+        self.assertEqual((self.work/'source/config.yml').read_text(), 'seed: 1\n')
 
 
 class TimeoutTests(unittest.TestCase):
@@ -521,11 +560,18 @@ class TimeoutTests(unittest.TestCase):
         manifest = study_manifest(sample_config('/tmp'))
         data = bootstrap.render(manifest, {'HCLOUD_WORKER_TOKEN': 'fake-token'}, 'fake-rclone')
         self.assertLess(len(data.encode()), 32768)
-        files = {f['path']: base64.b64decode(f['content']) for f in json.loads(data.split('\n',1)[1])['write_files']}
+        files = {f['path']: decode_cloud_file(f) for f in json.loads(data.split('\n',1)[1])['write_files']}
         with zipfile.ZipFile(io.BytesIO(lzma.decompress(files['/opt/cloud-experiments/code.zip.xz']))) as bundle:
             for name in bundle.namelist():
                 compile(bundle.read(name), name, 'exec')
             self.assertIn('cloud_experiments/persistence.py', bundle.namelist())
+        with tempfile.TemporaryDirectory() as directory:
+            package = Path(directory) / 'worker.zip'
+            package.write_bytes(lzma.decompress(files['/opt/cloud-experiments/code.zip.xz']))
+            result = subprocess.run([sys.executable, '-I', '-c',
+                'import sys; sys.path.insert(0, sys.argv[1]); import cloud_experiments.worker', str(package)],
+                capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
         self.assertIn(b'cloud-delete.service', files['/etc/systemd/system/cloud-reap.timer'])
         self.assertIn(b'12min', files['/etc/systemd/system/cloud-finalize.service'])
 

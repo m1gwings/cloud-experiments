@@ -1,6 +1,5 @@
 """Opt-in webhook delivery, with only synthetic credentials and fake processes."""
 
-import base64
 import contextlib
 import io
 import json
@@ -12,7 +11,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from test_core import sample_config, sample_manifest
+from test_core import decode_cloud_file, sample_config, sample_manifest
 from cloud_experiments import bootstrap, cli, config, source, worker
 from cloud_experiments.common import Error, read_json, write_json
 
@@ -51,8 +50,8 @@ class DiscordTests(unittest.TestCase):
         credential = files[path]
         self.assertEqual(credential["permissions"], "0600")
         self.assertEqual(credential["owner"], "root:root")
-        self.assertEqual(base64.b64decode(credential["content"]).decode(), WEBHOOK)
-        unit = base64.b64decode(files["/etc/systemd/system/cloud-experiment.service"]["content"]).decode()
+        self.assertEqual(decode_cloud_file(credential).decode(), WEBHOOK)
+        unit = decode_cloud_file(files["/etc/systemd/system/cloud-experiment.service"]).decode()
         self.assertIn("LoadCredential=ews-discord-webhook:" + path, unit)
         self.assertNotIn(WEBHOOK, unit)
         self.assertNotIn("fake-cloud-token", unit)
@@ -65,9 +64,9 @@ class DiscordTests(unittest.TestCase):
     def test_disabled_forwarding_retains_root_lifecycle_webhook_only(self):
         _, _, files = self.rendered(False)
         self.assertNotIn("/opt/cloud-experiments/ews-discord-webhook", files)
-        unit = base64.b64decode(files["/etc/systemd/system/cloud-experiment.service"]["content"]).decode()
+        unit = decode_cloud_file(files["/etc/systemd/system/cloud-experiment.service"]).decode()
         self.assertNotIn("LoadCredential=", unit)
-        secrets = json.loads(base64.b64decode(files["/opt/cloud-experiments/credentials.json"]["content"]))
+        secrets = json.loads(decode_cloud_file(files["/opt/cloud-experiments/credentials.json"]))
         self.assertEqual(secrets["DISCORD_WEBHOOK_URL"], WEBHOOK)
 
     @unittest.skipUnless(shutil.which("systemd-analyze"), "systemd-analyze not installed")
@@ -77,7 +76,7 @@ class DiscordTests(unittest.TestCase):
         for name, entry in files.items():
             if name.startswith("/etc/systemd/system/"):
                 path = self.root / Path(name).name
-                content = base64.b64decode(entry["content"]).decode().replace("/usr/bin/tmux", "/usr/bin/true")
+                content = decode_cloud_file(entry).decode().replace("/usr/bin/tmux", "/usr/bin/true")
                 path.write_text(content)
                 paths.append(str(path))
         result = subprocess.run(["systemd-analyze", "verify", "--man=no", *paths], capture_output=True)
@@ -101,7 +100,7 @@ class DiscordTests(unittest.TestCase):
         replacement = WEBHOOK + "-rotated"
         payload = bootstrap.render(reproduced, {"HCLOUD_WORKER_TOKEN": "fake", "DISCORD_WEBHOOK_URL": replacement}, "fake")
         credential = next(entry for entry in json.loads(payload.split("\n", 1)[1])["write_files"] if entry["path"].endswith("/ews-discord-webhook"))
-        self.assertEqual(base64.b64decode(credential["content"]).decode(), replacement)
+        self.assertEqual(decode_cloud_file(credential).decode(), replacement)
         self.assertNotIn(replacement, json.dumps(reproduced))
         del original["settings"]["ews_discord"]  # old manifests keep the original no-forwarding behavior
         self.assertFalse(cli.reproduce_manifest(self.config, original, "legacy")["settings"]["ews_discord"])

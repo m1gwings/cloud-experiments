@@ -20,8 +20,8 @@ import urllib.error
 import urllib.request
 
 from .common import Error, command, read_json, redact, remote_path, require_managed, utcnow, write_json
-from .source import extract_snapshot, inventory
-from . import environment, persistence
+from .workspace import extract_snapshot, inventory
+from . import environment, persistence, ews_contract, synchronization
 
 BASE = Path("/opt/cloud-experiments")
 WORK = Path("/work")
@@ -79,10 +79,11 @@ def notify(manifest, secrets, api=http_json):
     url = secrets.get("DISCORD_WEBHOOK_URL")
     if url:
         try:
-            message = (f"{manifest['run_id']}: {manifest['status']} | {manifest['machine']} | "
-                       f"exit={manifest.get('exit_code')} | elapsed={manifest.get('elapsed_seconds', 0)}s")
-            if manifest.get("upload", {}).get("status") == "failed":
-                message += " | artifact upload FAILED"
+            message = (f"{manifest['run_id']}: {manifest['status']} | "
+                       f"EWS={manifest.get('compute', {}).get('status', 'pending')} | "
+                       f"recovery={manifest.get('last_recovery', {}).get('committed_at', 'none')} | "
+                       f"archive={manifest.get('archive', {}).get('status', 'pending')} | "
+                       f"VM deletion={manifest.get('deletion', {}).get('status', 'pending')}")
             api(url, method="POST", body={"content": message, "allowed_mentions": {"parse": []}})
         except Exception:
             print("Discord notification failed; cleanup continues.", flush=True)
@@ -93,6 +94,7 @@ class Worker:
         self.base, self.work, self.run = Path(base), Path(work), run
         self.out = self.base / "out"
         self.manifest_path = self.base / "manifest.json"
+        self.state_lock = threading.RLock()
 
     def manifest(self):
         return read_json(self.manifest_path)
@@ -104,8 +106,34 @@ class Worker:
         return self.run(["systemctl", *args], **kwargs)
 
     def save(self, manifest):
-        write_json(self.manifest_path, manifest)
-        write_json(self.out / "manifest.json", manifest)
+        with self.state_lock:
+            reason = self.base / "reason.json"
+            if manifest.get("status") == "running" and reason.exists():
+                requested = read_json(reason)
+                manifest.update(status="finalizing", compute={"status": requested["status"],
+                                "exit_code": requested["exit_code"]}, archive={"status": "pending"})
+            write_json(self.manifest_path, manifest)
+            write_json(self.out / "manifest.json", manifest)
+
+    def publish_lifecycle(self, manifest, *, persist=True):
+        """A small independent status write must never wait for artifact collection."""
+        with self.state_lock, (self.base / "lifecycle.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            self._publish_lifecycle(manifest, persist=persist)
+
+    def _publish_lifecycle(self, manifest, *, persist=True):
+        if persist:
+            self.save(manifest)
+        lifecycle = {key: manifest[key] for key in
+                     ("run_id", "status", "compute", "last_recovery", "sync", "archive", "deletion", "ews", "tooling")
+                     if key in manifest}
+        lifecycle.update(schema_version=1, updated_at=utcnow())
+        path = self.base / "lifecycle.json"
+        write_json(path, lifecycle)
+        try:
+            self.rclone("copyto", str(path), remote_path(manifest["storage"], manifest["run_id"]) + "/lifecycle.json", timeout=15)
+        except Exception:
+            print("Lifecycle status publication failed; cleanup protection remains active.", flush=True)
 
     def request(self, status, exit_code=None):
         # Only root can request cancellation or choose the final status.
@@ -114,10 +142,17 @@ class Worker:
             path = self.base / "reason.json"
             previous = read_json(path) if path.exists() else None
             current = self.manifest()
-            if current["status"] in ("completed", "failed", "cancelled", "timeout"):
+            if current["status"] in ("completed", "failed", "cancelled", "timeout", "finalization_failed"):
                 return  # Deletion may be retrying; do not rewrite a finished run as timeout.
             if previous is None or status == "timeout" or current["status"] == "setup_failed":
                 write_json(path, {"status": status, "exit_code": exit_code})
+            current.update(status="finalizing", compute={"status": status, "exit_code": exit_code,
+                                                       "finished_at": utcnow()}, archive={"status": "pending"})
+            # Cancellation may arrive in another process while a sync accepts a
+            # new parent. The request must never overwrite recovery bookkeeping.
+            # reason.json is authoritative until the finalizer stops the writer.
+            self.publish_lifecycle(current, persist=False)
+            notify(current, self.secrets())
         self.systemctl("start", "--no-block", "cloud-finalize.service")
 
     def rclone(self, *args, timeout=180):
@@ -211,7 +246,10 @@ class Worker:
             shutil.copyfile(self.base / "incoming/index.json", self.out / "source/index.json")
             (self.out / "config").mkdir(exist_ok=True)
             shutil.copyfile(self.work / "source" / m["config"]["path"], self.out / "config/experiment-config")
-            expected_environment = persistence.restore(self, m) if m.get("study_id") else None
+            expected_environment = None
+            if m.get("study_id") and m["ews"].get("cloud_contract"):
+                self.verify_lease(m)
+                _, expected_environment = persistence.read_head(self, m)
             if not expected_environment and m.get("reproduction_environment_sha256"):
                 from .common import sha256
                 path = self.base / "incoming/environment.json"
@@ -247,11 +285,21 @@ class Worker:
             frozen = self.user_step(["python", "-m", "pip", "freeze"]).stdout.decode(errors="replace")
             (self.out / "machine").mkdir(exist_ok=True)
             (self.out / "machine/pip-freeze.txt").write_text(redact(frozen, self.secrets().values()))
+            runtime_options = None
+            if m["ews"].get("cloud_contract"):
+                # Reject changed capabilities/resources before sealing an environment.
+                ews_contract.query(self, m["ews"]["cloud_contract"])
+                runtime_options = ews_contract.runtime_options(self, m)
             if m.get("study_id"):
-                # Capability check plus configuration validation before starting any scientific work.
-                if m.get("portable_continuation", True):
+                if runtime_options is None and m.get("portable_continuation", True):
+                    # Legacy reproductions retain their original resource checks.
                     self.user_step(["python", "-c", "from experiments_wo_stress import load_config; from experiments_wo_stress.execution.portability import portable_environment; import sys; portable_environment(load_config(sys.argv[1]))", str(source / m["config"]["path"])])
                 self.seal_environment(m, expected_environment)
+                if runtime_options is not None:
+                    restored_environment = persistence.restore(self, m)
+                    if restored_environment:
+                        environment.verify(restored_environment, self.capture_environment())
+                    self.run(["chown", "-R", "experiment:experiment", str(self.work / "output")])
             baseline, _ = inventory(self.work, self.patterns(m))
             # Source baseline always means the uploaded snapshot, before pip/build hooks.
             baseline = {k: v for k, v in baseline.items() if not k.startswith("source/")}
@@ -262,24 +310,19 @@ class Worker:
                 if m.get("portable_continuation", True):
                     argv.append("--portable")
                 (self.work / "runtime/portable").touch()
+            if runtime_options:
+                argv = ews_contract.command_options(argv, runtime_options, m["settings"].get("timezone"))
+                m["runtime"] = runtime_options
             write_json(self.work / "runtime/command.json", argv, mode=0o644)
-            m.update(status="running", started_at=utcnow(), executed_command=argv)
+            m.update(status="running", started_at=utcnow(), executed_command=argv,
+                     compute={"status": "running"}, archive={"status": "pending"}, deletion={"status": "pending"})
             m["machine_info"] = self.machine_info()
             self.save(m)
             self.upload(m)
-            self.systemctl("start", "cloud-experiment.service")
+            self.start_experiment()
             (self.base / "started").touch()
             notify(m, self.secrets())
-            while True:
-                result_path = self.work / "runtime/exit.json"
-                if result_path.exists():
-                    code = read_json(result_path)["exit_code"]
-                    self.request("completed" if code == 0 else "failed", code)
-                    return
-                active = self.systemctl("is-active", "cloud-experiment.service", check=False)
-                if active.returncode:
-                    raise Error("Experiment tmux service exited without a completion record.")
-                time.sleep(2)
+            synchronization.monitor(self, m)
         except Exception as exc:
             m["setup_error"] = str(exc) if isinstance(exc, Error) else "Worker setup/execution failed (details withheld)."
             self.save(m)
@@ -289,8 +332,13 @@ class Worker:
             self.request("failed" if (self.base / "started").exists() else "setup_failed")
 
     def patterns(self, manifest):
-        owned = ["output", "output/*"] if manifest.get("study_id") else []
+        owned = ["output", "output/*"] if manifest.get("study_id") and manifest["ews"].get("cloud_contract") else []
         return ["runtime", "runtime/*", ".ews", ".ews/*", *owned, *manifest["settings"]["artifact_exclude"]]
+
+    def start_experiment(self):
+        for name in ("exit.json", "child-pid.json", "stop-requested"):
+            (self.work / "runtime" / name).unlink(missing_ok=True)
+        self.systemctl("start", "cloud-experiment.service")
 
     def machine_info(self):
         return {"python": sys.version, "platform": platform.platform(), "uname": list(platform.uname()),
@@ -316,14 +364,6 @@ class Worker:
         info = self.machine_info()
         write_json(self.out / "machine/runtime.json", info)
         manifest["machine_info"] = info
-        if manifest.get("study_id"):
-            persistence.collect_state(self, manifest)
-            if manifest.get("state_inventory_sha256"):
-                try:
-                    result = self.user_step(["ews", "inspect", str(self.work / "output")], timeout=30)
-                    manifest["ews_counts"] = json.loads(result.stdout)["counts"]
-                except Exception:
-                    manifest["ews_counts"] = {}  # Can retain state; cannot claim exact completion.
 
     def interrupt_experiment(self, grace=90):
         """Ask the unprivileged PTY wrapper to signal EWS alone, then bound the wait."""
@@ -352,38 +392,69 @@ class Worker:
                 supervisor = self.systemctl("stop", "cloud-supervisor.service", timeout=40, check=False)
                 if supervisor.returncode:
                     raise Error("Setup cgroup did not stop; refusing a live filesystem snapshot.")
+                # The supervisor may have finished a sync while finalization was
+                # requested. Read its last durable commit only after it stops.
+                m = self.manifest()
+                m.update(status="finalizing", compute={"status": reason["status"],
+                         "exit_code": reason["exit_code"], "finished_at": utcnow()},
+                         archive={"status": "syncing"})
+                self.publish_lifecycle(m)
                 self.interrupt_experiment()
                 stopped = self.systemctl("stop", "cloud-experiment.service", timeout=40, check=False)
                 if stopped.returncode:
                     raise Error("Experiment cgroup did not stop; refusing a live filesystem snapshot.")
-                m.update(reason)
+                m["exit_code"] = reason["exit_code"]
                 m["finished_at"] = utcnow()
                 start = dt.datetime.fromisoformat(m.get("started_at") or m["created_at"])
                 m["elapsed_seconds"] = round((dt.datetime.now(dt.timezone.utc) - start).total_seconds(), 3)
                 m["retained_until_deadline"] = keep
-                try:
-                    self.collect(m)
-                except Exception:
-                    m.pop("state_inventory_sha256", None)
-                    m["collection_error"] = "Artifact collection was incomplete; compute cleanup takes priority."
-                self.save(m)
-                try:
-                    self.upload(m, final=True)
-                    if m.get("study_id"):
-                        persistence.publish_state(self, m)
-                except Exception:
-                    m["upload"] = {"status": "failed", "error": "Upload or verification failed; some artifacts may be missing."}
-                    self.save(m)
-                    print("Result upload failed; VM deletion will still be attempted.", flush=True)
+                if m["ews"].get("cloud_contract") and (self.base / "environment-ready.json").exists() and (self.base / "started").exists():
+                    m["sync"] = {"status": "syncing", "attempted_at": utcnow(), "contract": m["ews"]["cloud_contract"]}
+                    self.publish_lifecycle(m)
                     try:
-                        self.rclone("copyto", str(self.out / "manifest.json"), remote_path(m["storage"], m["run_id"]) + "/manifest.json", timeout=30)
+                        result = self.user_step(["ews", "inspect", str(self.work / "output")], timeout=30)
+                        m["ews_counts"] = json.loads(result.stdout)["counts"]
                     except Exception:
-                        pass
+                        m["ews_counts"] = {}
+                    persistence.sync(self, m, final=True)
+                    m["sync"] = {"status": "committed", "attempted_at": utcnow(), "contract": m["ews"]["cloud_contract"]}
+                    self.publish_lifecycle(m)
+                self.collect(m)
+                # Output bytes already live in the recovery object pool. Only
+                # logs, inputs, provenance and other workspace deltas remain.
+                self.upload(m, final=True)
+                m.update(reason)
+                m["archive"] = {"status": "published", "published_at": utcnow()}
+                self.save(m)
+                remote = remote_path(m["storage"], m["run_id"]) + "/manifest.json"
+                self.rclone("copyto", str(self.out / "manifest.json"), remote, timeout=30)
+                self.publish_lifecycle(m)
                 notify(m, self.secrets())
+                write_json(done, reason)
+            except Exception:
+                m["status"] = "finalization_failed"
+                m["compute"] = {"status": reason["status"], "exit_code": reason["exit_code"]}
+                m["archive"] = {"status": "failed"}
+                if m.get("sync", {}).get("status") == "syncing":
+                    m["sync"]["status"] = "failed"
+                m["upload"] = {"status": "failed", "error": "Final synchronization or archive publication failed; preceding recovery is retained."}
+                self.publish_lifecycle(m)
+                notify(m, self.secrets())
+                print("Finalization failed; VM deletion will still be attempted.", flush=True)
                 write_json(done, reason)
             finally:
                 if not keep:
                     self.systemctl("start", "--no-block", "cloud-delete.service")
+
+    def delete(self):
+        """Best-effort status is independent of finalizer success or service timeout."""
+        m = self.manifest()
+        if m.get("status") in ("running", "provisioning", "finalizing"):
+            m["status"] = "interrupted" if m["status"] != "finalizing" else "finalization_failed"
+        m["deletion"] = {"status": "requested", "requested_at": utcnow()}
+        self.publish_lifecycle(m, persist=False)
+        notify(m, self.secrets())
+        delete_self(m, self.secrets())
 
 
 def execute(work=WORK):
@@ -424,7 +495,7 @@ def execute(work=WORK):
         thread.start()
     # script supplies the experiment with a real PTY for EWS's dashboard and logs it.
     try:
-        result = subprocess.run(["script", "--quiet", "--return", "--flush", "--command", shlex.join(argv),
+        result = subprocess.run(["script", "--quiet", "--return", "--flush", "--append", "--command", shlex.join(argv),
                                  str(work / "runtime/console.log")], cwd=work / "source", env=env)
     finally:
         done.set()
@@ -451,7 +522,7 @@ def main():
         worker.request(action)
     elif action == "delete":
         # systemd restarts this service on failure, even if the finalizer has died.
-        delete_self(worker.manifest(), worker.secrets())
+        worker.delete()
     else:
         raise Error("Unknown worker operation.")
 

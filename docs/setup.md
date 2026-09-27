@@ -178,8 +178,39 @@ bucket = "migwings-experiments"
 
 [ews]
 repository = "https://github.com/m1gwings/experiments-wo-stress.git"
-default_ref = "main"
+default_ref = "d14d5c0fd334140ffd8f64e555a9f7112f274972"
+
+[run]
+sync_seconds = 300
+# timezone = "Europe/Rome"
 ```
+
+Keep an explicit EWS commit in `default_ref`, or supply it with `--ews-ref`.
+The revision above exposes the supported EWS recovery contract version 1.
+The launcher checks the selected revision's contract before creating a VM, then
+the worker queries the installed public API again. The EWS commit records source
+provenance; its recovery contract version determines persistence compatibility.
+Unsupported contracts require compatible tooling or a deliberate new lineage;
+old cloud study state without the recovery contract requires `--fresh`.
+
+`sync_seconds` is a positive finite interval, defaulting to 300 seconds. EWS
+recovery v1 requires a stopped writer, so each interval requests a graceful
+checkpoint, seals the safe output through EWS, then resumes the sole invocation.
+Upload runs while compute continues and transfers only new content. A long
+protocol step, snapshot sealing, or unavailable storage can extend the time
+since the last durable recovery point. Check that time in `cloud-status`.
+
+`timezone` is an optional display override passed as EWS's `--timezone`.
+EWS validates the installed IANA name on the VM; omitted values preserve the
+study display setting. Use `timezone = "UTC"` to select explicit server UTC,
+or for example `"Europe/Rome"` for local display. Persisted timestamps remain UTC.
+
+Supported CPU execution passes all available logical CPUs to EWS's `--workers`,
+regardless of a smaller `execution.workers` in the YAML. The actual count is
+recorded in runtime provenance and the executed command. Workers, sync interval,
+and display timezone are operational settings; cloud does not rewrite scientific
+YAML. Portable continuation rejects GPU/custom checkpoint configurations through
+EWS's resource checks. No concurrent EWS invocations share an output.
 
 For studies that want EWS Discord progress, add to the existing `[run]` table
 (create it if absent; do not add duplicate TOML tables):
@@ -241,6 +272,19 @@ It never copies/modifies credentials. If instructed, add that directory to PATH.
 `cloud-doctor` is offline: it reads only non-secret configuration and checks local
 executables. It does not validate tokens, SSH authentication, account limits, or
 cloud permissions. Tests use synthetic files and fake providers only.
+
+To upgrade an existing checkout and refresh the installed command links:
+
+```bash
+git pull --ff-only
+./install
+cloud-doctor
+```
+
+Review the release's supported EWS recovery contract before changing the EWS
+pin. Updates apply to future attempts; running VMs retain their bundled tooling.
+Run/study manifests retain the cloud package version, Git revision when available,
+implementation fingerprint, exact EWS commit, and recovery contract version.
 
 Optional non-billable connectivity checks, run explicitly by you:
 
@@ -347,6 +391,11 @@ since the original run do not affect its source. See the README for dependency
 and public-EWS-availability limitations. This differs from ordinary repeated
 `cloud-run`, which restores the existing study output.
 
+Reproduction checks the archived exact EWS commit for the supported recovery
+contract and requires the standard EWS command. Unsupported legacy pins or custom
+commands fail before compute creation; their archives remain downloadable for
+local reproduction. A deliberate new cloud run can select a compatible EWS pin.
+
 ## 11. Cancellation and failure recovery
 
 ```bash
@@ -356,8 +405,8 @@ cloud-cancel RUN_ID --force-delete --yes  # last resort: unsaved results may be 
 ```
 
 Normal cancellation requests a safe EWS checkpoint, then bounded process-group
-termination, and collects complete partial
-data, upload, notify, and delete. It returns once that request is accepted; check
+termination, one final incremental recovery/archive sync, notification, and
+deletion. It returns once that request is accepted; check
 status afterwards. Forced deletion verifies live management/run labels and the
 immutable server ID before issuing a delete. It may leave the remote manifest at
 its last known status. Never manually delete an unrelated VM to resolve a run.
@@ -370,10 +419,13 @@ Inspect `/opt/cloud-experiments/out/logs/setup.log` or
 or whole cloud-init user-data. If initial SSH/bootstrap cannot be verified, the
 laptop may delete the failed worker even with this flag, to protect billing.
 
-An Object Storage outage does not keep compute alive: upload is bounded, failure
-is logged/recorded where possible, and deletion still takes priority. A stale
-remote `running` manifest with no VM can mean persistence failed. The preflight
-source/config should still be available. If the CLI says cleanup was not
+An Object Storage outage does not keep compute alive indefinitely: periodic
+upload failures retry while compute continues, and final cleanup remains bounded.
+Lifecycle metadata reports compute completion separately from recovery sync,
+archive publication, and VM deletion. When the provider confirms no managed VM
+exists, a remote `running` manifest is displayed as `interrupted`. The latest
+committed compatible recovery remains the continuation point, even if finalization
+failed. If the CLI says cleanup was not
 confirmed, check `cloud-status RUN_ID` and Console promptly.
 
 **Hetzner bills stopped servers. Power-off is not cleanup.** Deadline timers

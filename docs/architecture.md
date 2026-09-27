@@ -9,17 +9,21 @@ shared package in `lib/cloud_experiments` has no third-party Python dependencies
 | `config.py` | Non-secret TOML validation; runtime-only credential selection. |
 | `common.py` | Safe subprocess wrapper, IDs, atomic JSON, hashing, label checks. |
 | `progress.py` | Nested stderr activities, TTY detection, periodic updates, numeric transfer statistics. |
-| `source.py` | Git inspection, exact snapshots, safe extraction, file inventories. |
+| `source.py` | Git inspection, exact source snapshots and EWS pin discovery. |
+| `workspace.py` | Safe extraction, secret/path exclusions and workspace inventories. |
 | `artifacts.py` | Discover and validate EWS semantic catalogs; resolve role paths without internal layout mappings. |
 | `providers.py` | Structured hcloud/rclone arguments; quoted SSH; remote manifests. |
 | `bootstrap.py` | Compressed Python bundle and systemd units in cloud-init JSON/YAML. |
 | `studies.py` | Stable logical IDs, exact-request fingerprints and parent-linked state validation. |
 | `environment.py` | Safe exact environment capture, requirements and validation. |
-| `persistence.py` | Complete output inventories, verified restore and immutable publication. |
+| `ews_contract.py` | Explicit supported EWS recovery envelope and public API adapter. |
+| `provenance.py` | Cloud implementation revision and content fingerprint. |
+| `persistence.py` | Shared content objects, verified recovery restore, pruning and commits. |
+| `synchronization.py` | Cooperative periodic pause, seal, resume and retry. |
 | `worker.py` | Installation, PTY execution, supervision, finalization, direct API deletion. |
 
 The default EWS argument array, explicit portable CPU/NumPy policy, inspect counts,
-optional webhook environment name, and versioned artifact catalog contract are
+optional webhook environment name, recovery v1 and versioned artifact catalog are
 EWS-specific. Checkpoint decoding/selection is exclusively EWS-owned. Paper-specific algorithms, instance generators, and
 configuration belong in experiment repositories.
 
@@ -35,13 +39,17 @@ configuration belong in experiment repositories.
    upload. Readiness requires both active timers. Boot-relative timers provide a
    second trigger if first boot initialization passed a deadline.
 4. Laptop transfers source/index and starts `cloud-supervisor.service`. The root
-   supervisor installs OS tools, acquires/verifies its provider lease, restores the
-   complete verified EWS output and recreates the locked unprivileged environment.
+   supervisor installs OS tools, verifies its provider lease, recreates the locked
+   unprivileged environment, queries EWS compatibility and restores committed output.
    Source, EWS checkout, runtime and package checks precede execution.
 5. A dedicated systemd cgroup runs the experiment's tmux server as `experiment`.
    `script` gives the command a PTY and captures stdout/stderr together. A file
    records the command exit code; the root supervisor watches it and the service.
    Losing tmux is detected as a failure even if the exit record is absent.
+   The runtime supplies all available CPU workers and validates display timezone
+   through EWS. A periodic graceful pause lets EWS seal a recovery snapshot; the
+   sole invocation resumes before incremental network transfer. Transfer failures
+   leave the preceding committed snapshot usable and retry at later intervals.
    When `run.ews_discord` is enabled, systemd loads only the Discord webhook
    into this service's protected credential directory. The wrapper reads it
    through `CREDENTIALS_DIRECTORY` and constructs the EWS environment explicitly;
@@ -50,10 +58,13 @@ configuration belong in experiment repositories.
    credential paths remain inaccessible to the experiment service.
 6. Completion, failure, cancellation, or a deadline starts a separate root
    finalizer. It stops setup, asks EWS to checkpoint through SIGINT with 90 seconds
-   grace, then stops the experiment cgroup. It collects complete EWS output and other workspace deltas,
-   writes metadata, copies/checks payloads, then publishes/verifies the manifest.
-   Upload errors get a bounded best-effort manifest-only retry.
-7. Optional Discord notification is bounded and cannot prevent deletion. A
+   grace, then stops the experiment cgroup. It runs the same recovery sync one
+   final time, collects other workspace deltas, and publishes final archive state
+   only after verification. Small lifecycle records precede large operations and
+   carry failures independently of artifact transfer.
+7. Discord distinguishes compute, recovery, archive and deletion requests. It is
+   bounded and cannot prevent deletion. The deletion service independently
+   publishes a small status even if the finalizer has been killed. A
    finally block starts `cloud-delete.service`; systemd `OnFailure` handles an
    abnormal finalizer exit/timeout. Deletion failures restart after 30 seconds.
 8. At the original deadline + 15 minutes, the independently installed reap timer
@@ -82,14 +93,17 @@ transition to timeout or cancellation at a later request.
 | Laptop dies before/during setup | First-boot timers remain responsible for eventual deletion. |
 | pip/apt hangs | Supervisor cgroup stopped at deadline; forced kill after 20 seconds. |
 | Experiment exits / tmux dies | Capture exit when available; finalize as completed/failed. |
-| Upload/collection failure | Record partial failure where possible; delete anyway. |
+| Periodic sync failure | Retain preceding recovery; resume compute and retry later. |
+| Final upload/collection failure | Record `finalization_failed` independently; delete anyway. |
 | Finalizer hangs or crashes | Bounded service, OnFailure deletion, and independent reap timer. |
 | Worker API permission/availability failure | Retry deletion; user must restore access or intervene. |
 | Guest never boots/cloud-init fails/kernel freezes | No in-guest guarantee; inspect Console. |
 
 No filesystem or network API provides an atomic transaction spanning source
 upload, manifest upload, and server deletion. A stale manifest does not prove a
-VM is running; `cloud-status` consults actual managed servers. Last-resort deletion
+VM is running; both status and results listings consult managed servers and show
+`interrupted` for active stored state with no VM. Unknown provider state is not
+absence. Last-resort deletion
 may leave partial artifacts, because limiting compute cost is the stated priority.
 
 ## Snapshot and artifact invariants
@@ -128,12 +142,17 @@ option grants the research process webhook access, not Hetzner/S3 access.
 
 Result browsing uses recursive `rclone lsjson --files-only --no-modtime
 --no-mimetype` at the validated run prefix. Only object paths and byte sizes are
-retained; file bodies and hashes are not fetched. The default redirected output
+retained for legacy archives. Modern recovery views also read committed recovery
+inventories and their hashes to expose logical paths; output payloads are not
+fetched by listing. The default redirected output
 is headerless TSV, and `--json` provides structured records. Paths are validated
 before rendering to keep controls/traversal out of terminal output and downloads.
 
-Study semantic pulls select the authoritative committed attempt first.
-Attempt/legacy semantic pulls discover a unique `artifacts.json` under captured `artifacts/`
+Modern recovery pulls materialize only the selected committed inventory from
+content-addressed objects, verifying SHA-256 and sizes. Listings expose logical
+`artifacts/output` paths rather than implementation object keys. Study semantic
+pulls select the authoritative committed snapshot first.
+Legacy semantic pulls discover a unique `artifacts.json` under captured `artifacts/`
 using the listing. Its parent is the EWS output root, even for a custom command.
 The catalog discriminator is `experiments-wo-stress/artifacts`, version 1;
 `figures`, `analysis`, and `compute_report` map to CLI selectors. Bounded metadata
@@ -158,8 +177,10 @@ Destination symlinks and the reserved full-download marker are rejected before
 copying. Semantic file roles match only the exact object; directory roles match
 only descendants. Missing generic paths and provider failures remain errors.
 Selective copies share the transfer progress adapter and never create/refresh
-`.cloud-pulled.json`. Full pulls still write that marker after success, and
-`sync` still downloads whole runs. No result command deletes remote objects.
+`.cloud-pulled.json`. Full pulls write that marker after success. Modern pulls include current recovery
+and attempt archives; superseded output is explicitly unavailable once pruned.
+A verified full output replaces the local output tree, preventing deleted tails
+from reappearing. No result command deletes remote objects.
 
 `python3 -m unittest discover -s tests -v` exercises real local Git snapshots with
 temporary directories and mocked provider effects. Synthetic tokens never leave
@@ -192,5 +213,14 @@ Uploads use [rclone check](https://rclone.org/commands/rclone_check/) for sizes 
 available remote hashes, followed by an exact manifest read-back. Source/config
 reproduction additionally verifies SHA-256 locally. EWS CLI defaults were checked
 against the local `experiments-wo-stress` README and `docs/CONFIGURATION.md` during
-implementation. New continuation requires the standard command and portable EWS
-capability; legacy reproduction preserves its original command.
+implementation. New continuation requires the standard command, explicit recovery v1 capability
+and portable EWS policy. Reproduction checks the exact archived pin against the
+supported contract and requires the standard command; legacy retrieval remains
+available without reinterpreting old recovery state.
+The detailed recovery transaction, delayed pruning and failure invariants live
+in [continuation.md](continuation.md#storage-and-publication).
+
+The bootstrap bundle includes only worker dependencies. Textual cloud-init files
+use its supported [gzip/base64 encoding](https://docs.cloud-init.io/en/25.3/reference/yaml_examples/write_files.html)
+when smaller, preserving the 32 KiB provider limit without shortening cleanup
+protection. Tests decode the exact payload and validate every systemd unit.

@@ -16,10 +16,12 @@ from . import __version__
 from .artifacts import artifact_selection
 from .bootstrap import render
 from .common import Error, FINAL, SHA_RE, read_json, run_id, sha256, utcnow, valid_result_path, valid_run, write_json
-from .config import DEPENDENCIES, load, repository_url, run_settings, runtime_hours, storage_credentials, worker_secrets
+from .config import DEFAULT_COMMAND, DEPENDENCIES, load, repository_url, run_settings, runtime_hours, storage_credentials, worker_secrets
 from .providers import Hetzner, SSH, Storage
 from .progress import Activity, human_bytes, interactive
-from .source import extract_snapshot, resolve_ref, snapshot
+from .source import extract_snapshot, resolve_ews, snapshot
+from .provenance import current as tooling_provenance
+from .ews_contract import validate_contract
 from .studies import STUDY_RE, attempt_id, repository_identity, request_key, study_id
 
 
@@ -39,7 +41,7 @@ def new_manifest(config, rid, experiment, config_path, source_sha, config_sha, e
         raise Error("Invalid server type.")
     hours = runtime_hours(hours if hours is not None else config["hetzner"]["max_runtime_hours"])
     now = dt.datetime.now(dt.timezone.utc)
-    return {"schema_version": 1, "tool_version": __version__, "run_id": valid_run(rid), "status": "provisioning",
+    return {"schema_version": 1, "tool_version": __version__, "tooling": tooling_provenance(), "run_id": valid_run(rid), "status": "provisioning",
             "experiment": experiment, "dirty": experiment["dirty"],
             "source": {"path": "source/source.tar.gz", "sha256": source_sha, "index": "source/index.json"},
             "config": {"path": config_path, "sha256": config_sha, "artifact": "config/experiment-config"},
@@ -160,16 +162,16 @@ def run_command(args, config):
     (out / "source/experiment-config").replace(out / "config/experiment-config")
     ref = args.ews_ref or config["ews"]["default_ref"]
     with Activity("Resolving pinned EWS revision"):
-        commit = resolve_ref(config["ews"]["repository"], ref)
+        ews = resolve_ews(config["ews"]["repository"], ref)
     with Activity("Checksumming source snapshot"):
         source_sha = sha256(out / "source/source.tar.gz")
     manifest = new_manifest(config, rid, experiment, config_path, source_sha,
-                            index[config_path]["sha256"], {"repository": config["ews"]["repository"], "requested_ref": ref, "commit": commit},
+                            index[config_path]["sha256"], ews,
                             machine=args.machine, hours=args.max_runtime, keep=args.keep_on_setup_failure)
     sid = args.study or study_id(experiment["repository"], config_path, args.fresh)
     if not STUDY_RE.fullmatch(sid):
         raise Error("--study must identify a logical study returned by cloud-run.")
-    if config["run"]["command"] != ["ews", "run", "{config}", "--output", "{output}"]:
+    if config["run"]["command"] != DEFAULT_COMMAND:
         raise Error("Automatic continuation requires the standard EWS command; custom commands are not portable.")
     manifest.update(study_id=sid, portable_continuation=True, name=args.name)
     manifest["request_key"] = request_key(manifest, index)
@@ -179,6 +181,8 @@ def run_command(args, config):
         return
     storage = Storage(config)
     head = storage.study_state(sid)
+    if head:
+        validate_contract(head.get("contract"))
     if args.study and sid in storage.studies():
         original = storage.study_manifest(sid)
         if (repository_identity(original["experiment"]["repository"]) != repository_identity(experiment["repository"])
@@ -228,6 +232,13 @@ def reproduce(args, config):
     sid = study_id(original["experiment"]["repository"], original["config"]["path"], fresh=True)
     rid = attempt_id(sid)
     manifest = reproduce_manifest(config, original, rid)
+    if manifest["settings"]["command"] != DEFAULT_COMMAND:
+        raise Error("Cloud reproduction requires the standard EWS command and supported recovery contract; custom legacy archives remain available for download.")
+    # Reproduction retains the exact commit. Re-query the public contract rather
+    # than trusting missing or archived capability metadata for a new lineage.
+    manifest["ews"] = resolve_ews(original["ews"]["repository"], original["ews"]["commit"])
+    if "requested_ref" in original["ews"]:
+        manifest["ews"]["requested_ref"] = original["ews"]["requested_ref"]
     directory = state(config, rid)
     out = directory / "out"
     (out / "source").mkdir(parents=True)
@@ -264,7 +275,30 @@ def attach(args, config):
     return subprocess.call(ssh_for(config, server).attach_argv())
 
 
-def print_row(m, server=None):
+STATUS_HEADER = "STUDY/RUN\tSTATUS\tEWS\tRECOVERY\tARCHIVE\tVM\tMACHINE\tCONFIG\tAGE\tATTEMPT"
+ACTIVE_STATUSES = {"provisioning", "running", "finalizing"}
+
+
+def managed_servers(config):
+    """A failed provider lookup is unknown, never evidence that a VM is gone."""
+    try:
+        return Hetzner(config["hetzner"]).servers()
+    except (Error, ValueError, KeyError, TypeError):
+        print("Warning: cloud worker lookup failed; VM presence is unknown.", file=sys.stderr)
+        return None
+
+
+def matching_server(manifest, servers):
+    if servers is None:
+        return None
+    rid = manifest.get("attempt_id", manifest["run_id"])
+    matches = [server for server in servers if server["labels"]["run-id"] == rid]
+    if len(matches) > 1:
+        raise Error("Multiple servers match this run; refusing an ambiguous status.")
+    return matches[0] if matches else None
+
+
+def print_row(m, server=None, *, provider_known=True):
     stamp = m.get("created_at") or (server or {}).get("created")
     try:
         age = str(round((dt.datetime.now(dt.timezone.utc) - dt.datetime.fromisoformat(stamp.replace("Z", "+00:00"))).total_seconds() / 3600, 1)) + "h"
@@ -272,28 +306,40 @@ def print_row(m, server=None):
         age = "?"
     identity = m.get('study_id', m['run_id'])
     attempt = m.get('attempt_id', m['run_id']) if m.get('study_id') else '-'
-    print(f"{identity}\t{m.get('status', '?')}\t{m.get('machine', '?')}\t{m.get('config', {}).get('path', '?')}\t{age}\t{(server or {}).get('id', '-')}\t{attempt}")
+    status = m.get("status", "unknown")
+    if status in ACTIVE_STATUSES and server is None:
+        status = "interrupted" if provider_known else "unknown"
+    compute = m.get("compute", {}).get("status", "unknown")
+    recovery = m.get("last_recovery", {}).get("committed_at", "never")
+    if m.get("sync", {}).get("status") == "failed":
+        recovery += " (sync failed)"
+    archive = m.get("archive", {}).get("status", m.get("upload", {}).get("status", "unknown"))
+    if archive == "failed":
+        status = "finalization_failed"
+    vm = str(server["id"]) if server else "gone" if provider_known else "unknown"
+    print(f"{identity}\t{status}\t{compute}\t{recovery}\t{archive}\t{vm}\t{m.get('machine', '?')}\t{m.get('config', {}).get('path', '?')}\t{age}\t{attempt}")
 
 
 def status(args, config):
-    cloud, storage = Hetzner(config["hetzner"]), Storage(config)
-    print("STUDY/RUN\tSTATUS\tMACHINE\tCONFIG\tAGE\tSERVER\tATTEMPT")
+    if args.run_id:
+        valid_run(args.run_id)
+    storage = Storage(config)
+    servers = managed_servers(config)
+    print(STATUS_HEADER)
     if args.run_id:
         rid = valid_run(args.run_id)
-        servers = [cloud.find(rid)]
-        if not servers[0]:
-            print_row(storage.manifest(rid))
-            return
+        manifests = [storage.manifest(rid)]
     else:
-        servers = cloud.servers()
-    for server in servers:
-        rid = server["labels"]["run-id"]
-        try:
-            m = storage.manifest(rid)
-        except Error:
-            path = Path(config["local"]["state_dir"]) / rid / "manifest.json"
-            m = read_json(path) if path.exists() else {"run_id": rid, "machine": server["server_type"]["name"], "status": "unknown"}
-        print_row(m, server)
+        manifests = list(storage.manifests())
+        known = {m.get("attempt_id", m["run_id"]) for m in manifests}
+        for server in servers or []:
+            rid = server["labels"]["run-id"]
+            if rid not in known:
+                path = Path(config["local"]["state_dir"]) / rid / "manifest.json"
+                manifests.append(read_json(path) if path.exists() else {
+                    "run_id": rid, "machine": server["server_type"]["name"], "status": "unknown"})
+    for manifest in manifests:
+        print_row(manifest, matching_server(manifest, servers), provider_known=servers is not None)
 
 
 def cancel(args, config):
@@ -308,8 +354,13 @@ def cancel(args, config):
         if not sys.stdin.isatty() or input(f"{'DELETE' if args.force_delete else 'Cancel'} {rid}? Type the run ID: ").strip() != rid:
             raise Error("Cancellation not confirmed. Use --yes for explicit noninteractive confirmation.")
     if args.force_delete:
-        cloud.delete(server, server["labels"]["run-id"])
-        print("VM deleted. The remote manifest may still show its previous status.")
+        attempt = server["labels"]["run-id"]
+        cloud.delete(server, attempt)
+        try:
+            Storage(config).record_deletion(attempt)
+        except Error:
+            print("Warning: VM deleted, but its small lifecycle update could not be stored.", file=sys.stderr)
+        print("VM deleted. Recovery is available only through the last successful sync.")
     else:
         with Activity("Requesting cancellation and finalization"):
             ssh_for(config, server).call(["/usr/bin/python3", "/opt/cloud-experiments/entry.py", "cancelled"])
@@ -362,15 +413,16 @@ def pull_selection(storage, config, rid, selection=None, destination=None, *, ro
 def results(args, config):
     storage = Storage(config)
     if args.operation == "list":
-        print("STUDY/RUN\tSTATUS\tMACHINE\tCONFIG\tAGE\tSERVER\tATTEMPT")
+        if args.attempts and not STUDY_RE.fullmatch(args.attempts):
+            raise Error("--attempts requires a logical study ID.")
+        print(STATUS_HEADER)
+        servers = managed_servers(config)
         manifests = storage.manifests()
         if args.attempts:
-            if not STUDY_RE.fullmatch(args.attempts):
-                raise Error("--attempts requires a logical study ID.")
             history = storage.study_manifest(args.attempts)["attempts"]
             manifests = (storage.manifest(attempt["run_id"]) for attempt in history)
         for manifest in manifests:
-            print_row(manifest)
+            print_row(manifest, matching_server(manifest, servers), provider_known=servers is not None)
     elif args.operation == "ls":
         files = storage.files(valid_run(args.run_id))
         if args.json:

@@ -20,12 +20,13 @@ def artifact_selection(storage, rid, files, role):
         head = storage.study_state(rid)
         if head is None:
             raise Error("This study has no verified EWS state yet; use ls and --path for attempt logs.")
-        prefix = "attempts/" + head["attempt_id"] + "/artifacts/"
+        if head["schema_version"] == 1:
+            prefix = "attempts/" + head["attempt_id"] + "/artifacts/"
     candidates = [entry for entry in files
                   if entry["path"].startswith(prefix)
                   and entry["path"].endswith("/" + INDEX_FILENAME)]
     if not candidates:
-        raise Error("No EWS artifacts.json found (legacy run or metadata not uploaded). "
+        raise Error("No EWS artifacts.json found (legacy run, superseded recovery, or metadata not uploaded). "
                     "Use cloud-results ls RUN_ID, then pull RUN_ID --path RELATIVE_PATH.")
     if len(candidates) != 1:
         raise Error("Multiple artifact catalogs found; use cloud-results ls RUN_ID and --path "

@@ -1,5 +1,4 @@
 import argparse
-import base64
 import contextlib
 import io
 import json
@@ -11,8 +10,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from test_core import sample_config, sample_manifest
-from cloud_experiments import bootstrap, cli, source
+from test_core import decode_cloud_file, sample_config, sample_manifest
+from cloud_experiments import bootstrap, cli, ews_contract, source
 from cloud_experiments.common import Error, read_json, sha256, write_json
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -50,16 +49,42 @@ class InterfaceTests(unittest.TestCase):
             original = sample_manifest(c)
             original["source"]["sha256"] = sha256(archive)
             original["config"]["sha256"] = sha256(config_file)
+            verified_ews = {**original['ews'], 'cloud_contract': dict(ews_contract.CONTRACT)}
             args = argparse.Namespace(run_id="test-run", name="again")
-            with patch("cloud_experiments.cli.Storage") as storage, patch("cloud_experiments.cli.launch") as launch, patch("cloud_experiments.cli.resolve_ref", side_effect=AssertionError("must not resolve again")), patch("cloud_experiments.source.git", side_effect=AssertionError("must not consult current git")):
+            with patch("cloud_experiments.cli.Storage") as storage, patch("cloud_experiments.cli.launch") as launch, patch("cloud_experiments.cli.resolve_ews", return_value=verified_ews) as resolve, patch("cloud_experiments.source.git", side_effect=AssertionError("must not consult current scientific git")):
                 storage.return_value.manifest.return_value = original
                 storage.return_value.file.side_effect = lambda rid, name, dest: shutil.copyfile(archive, dest)
                 cli.reproduce(args, c)
                 _, manifest, directory = launch.call_args.args
                 self.assertTrue(manifest["dirty"])
-                self.assertEqual(manifest["ews"], original["ews"])
+                resolve.assert_called_once_with(original['ews']['repository'], original['ews']['commit'])
+                self.assertEqual(manifest["ews"], verified_ews)
                 self.assertEqual(manifest["reproduces_run_id"], "test-run")
                 self.assertEqual((directory / "out/config/experiment-config").read_text(), "seed: 999\n")
+
+    def test_incompatible_legacy_reproduction_fails_before_input_transfer_or_compute(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = sample_config(directory)
+            original = sample_manifest(config)
+            with patch('cloud_experiments.cli.Storage') as storage, patch('cloud_experiments.cli.launch') as launch, patch('cloud_experiments.cli.resolve_ews', side_effect=Error('Unsupported EWS cloud recovery contract')) as resolve:
+                storage.return_value.manifest.return_value = original
+                with self.assertRaisesRegex(Error, 'Unsupported EWS cloud'):
+                    cli.reproduce(argparse.Namespace(run_id='test-run'), config)
+                resolve.assert_called_once_with(original['ews']['repository'], original['ews']['commit'])
+                storage.return_value.file.assert_not_called()
+                launch.assert_not_called()
+
+    def test_custom_legacy_command_is_not_silently_given_recovery_semantics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = sample_config(directory)
+            original = sample_manifest(config)
+            original['settings']['command'] = ['python', 'custom.py']
+            with patch('cloud_experiments.cli.Storage') as storage, patch('cloud_experiments.cli.launch') as launch, patch('cloud_experiments.cli.resolve_ews') as resolve:
+                storage.return_value.manifest.return_value = original
+                with self.assertRaisesRegex(Error, 'standard EWS command'):
+                    cli.reproduce(argparse.Namespace(run_id='test-run'), config)
+                resolve.assert_not_called()
+                launch.assert_not_called()
 
     def test_sync_skips_unchanged_final_runs_but_refreshes_running_runs(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -87,7 +112,7 @@ class InterfaceTests(unittest.TestCase):
             for item in json.loads(payload.split("\n", 1)[1])["write_files"]:
                 if item["path"].startswith("/etc/systemd/system/"):
                     path = root / Path(item["path"]).name
-                    content = base64.b64decode(item["content"]).decode().replace("/usr/bin/tmux", "/usr/bin/true")
+                    content = decode_cloud_file(item).decode().replace("/usr/bin/tmux", "/usr/bin/true")
                     path.write_text(content)
                     paths.append(str(path))
             result = subprocess.run(["systemd-analyze", "verify", "--man=no", *paths], capture_output=True)

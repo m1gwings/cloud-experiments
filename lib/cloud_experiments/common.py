@@ -13,7 +13,7 @@ import time
 import uuid
 
 MANAGED = {"managed-by": "cloud-experiments"}
-FINAL = {"completed", "failed", "cancelled", "timeout", "setup_failed"}
+FINAL = {"completed", "failed", "cancelled", "timeout", "setup_failed", "finalization_failed", "interrupted"}
 RUN_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,62}\Z")
 SHA_RE = re.compile(r"[0-9a-f]{40}\Z")
 

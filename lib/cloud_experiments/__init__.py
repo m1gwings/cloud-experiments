@@ -1,3 +1,3 @@
 """Disposable, reproducible research workers. Python 3.11+, no dependencies."""
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"

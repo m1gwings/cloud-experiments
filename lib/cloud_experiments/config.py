@@ -50,9 +50,9 @@ def repository_url(value, public=False):
 
 def run_settings(settings):
     result = {"command": DEFAULT_COMMAND, "install_experiment": "auto", "artifact_exclude": [],
-              "ews_discord": False}
+              "ews_discord": False, "sync_seconds": 300, "timezone": None}
     result.update(settings)
-    if set(result) - {"command", "install_experiment", "artifact_exclude", "ews_discord"}:
+    if set(result) - {"command", "install_experiment", "artifact_exclude", "ews_discord", "sync_seconds", "timezone"}:
         raise Error("Unknown [run] setting.")
     if (not isinstance(result["command"], list) or not result["command"]
             or not all(isinstance(x, str) and x and "\x00" not in x for x in result["command"])):
@@ -63,6 +63,16 @@ def run_settings(settings):
         raise Error("run.artifact_exclude must be an array of relative glob patterns.")
     if not isinstance(result["ews_discord"], bool):
         raise Error("run.ews_discord must be a boolean.")
+    seconds = result["sync_seconds"]
+    if (isinstance(seconds, bool) or not isinstance(seconds, (int, float))
+            or not math.isfinite(seconds) or seconds <= 0):
+        raise Error("run.sync_seconds must be a positive finite number.")
+    zone = result["timezone"]
+    # The selected EWS revision resolves installed IANA names on the VM. Keep
+    # laptop configuration dependency-free and do not implement a second resolver.
+    if zone is not None and (not isinstance(zone, str) or not zone
+                             or any(not char.isprintable() for char in zone)):
+        raise Error("run.timezone must be an IANA timezone name such as Europe/Rome or UTC.")
     # Only literal replacement of these placeholders; no shell or format evaluation.
     return result
 

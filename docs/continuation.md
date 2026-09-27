@@ -1,205 +1,188 @@
 # One persistent study, disposable execution attempts
 
-```text
-logical study
-  ├── persistent EWS output (complete committed filesystem generations)
-  ├── attempt 1: VM → timeout → persist → delete
-  ├── attempt 2: VM → timeout → persist → delete
-  └── attempt 3: VM → completed → persist → delete
-```
-
-Repeat the same `cloud-run CONFIG --ews-ref FULL_COMMIT` after a timeout, failure,
-or cancellation. The VM is disposable; the logical study owns the output.
-Machine type and `--max-runtime` may change between attempts. The runtime limit
-includes setup and applies to one VM, never the study's total lifetime.
+Repeat `cloud-run CONFIG --ews-ref FULL_COMMIT` to continue the same study after
+an interruption, timeout, or cancellation. A replacement VM restores the newest
+committed compatible recovery snapshot. EWS decides which simulations, metrics,
+variants and checkpoints remain usable. Cloud tooling restores verified bytes;
+it does not make scientific reuse decisions.
 
 ## Identity and fresh studies
 
-The default ID is `s-` followed by the first 32 hex digits of SHA-256 over the
-canonical JSON array `[repository_identity, config_path]`. Repository identity is
-lowercase hostname plus repository path, without SSH username, leading/trailing
-slashes, or `.git`; HTTPS and SSH origins for the same repository agree. The
-configuration path is canonical and repository-relative. Renaming the repository
-or config therefore selects a different default study. Config/source contents,
-Git revisions, machine, runtime, timestamps, and VM IDs do not change it.
+A study ID derives from the canonical repository identity and config path.
+HTTPS and SSH URLs for the same repository agree. Source/config contents, EWS
+revisions, worker count, machine, display timezone and runtime limits do not
+change the lineage. Renaming the repository or config selects another study.
+`--fresh` deliberately creates an independent lineage; continue it with
+`--study STUDY_ID`. `--name` labels an attempt without changing its identity.
 
-`--fresh` assigns a random UUID-based `s-...` lineage. To continue that specific
-lineage, use the printed ID with `--study s-...`; repeating `--fresh` intentionally
-creates another lineage. Plain repeated `cloud-run` continues the deterministic
-default. `--study` checks the archived repository/config-path identity.
-`--name` is a descriptive manifest label, not identity.
+Each attempt has its own exact source/config archive, EWS Git commit, cloud
+implementation version/revision/content fingerprint, machine, executed command,
+runtime allocation, environment, timestamps, compute and publication outcomes.
+The completion shortcut requires an exact scientific request and verified EWS
+completion. Operational machine/runtime, sync interval and timezone changes do
+not invalidate that shortcut. EWS remains authoritative for changed requests.
 
-An execution attempt is `a-<32 study hex digits>-<20 random hex digits>`, so its
-storage location is resolvable without a lookup database. Each attempt has its
-own source/config archive, exact EWS commit, settings, machine/server metadata,
-timestamps, elapsed runtime, exit/upload status, logs, and environment.
+## Versioned EWS boundary
+
+This implementation supports **`experiments-wo-stress/recovery`, version 1**,
+verified against EWS commit `d14d5c0fd334140ffd8f64e555a9f7112f274972`.
+The commit is provenance, not the protocol version: other pins are accepted only
+when they expose the explicitly supported contract. The laptop checks the fetched
+public declarations before creating compute; the worker queries the installed API
+again. Manifests, recovery commits and sync metadata retain the contract version.
+
+EWS owns the [recovery contract and snapshot API](https://github.com/m1gwings/experiments-wo-stress/blob/d14d5c0fd334140ffd8f64e555a9f7112f274972/docs/CLOUD.md#versioned-recovery-snapshots).
+Cloud code consumes its sealed inventory instead of interpreting checkpoint,
+trajectory or analysis directories. Unknown contracts fail closed. Older cloud
+state without this contract remains browsable, but cannot silently become a
+modern recovery lineage: use `--fresh` or an explicit future migration.
+
+## Periodic synchronization
+
+`run.sync_seconds` defaults to 300. At each interval the wrapper requests graceful
+EWS interruption. Once the sole writer exits, EWS creates a sealed recovery
+snapshot; then compute resumes before network transfer. No independent EWS
+invocations overlap. A completed invocation proceeds directly to finalization.
+
+**Recovery v1 does not support live snapshots.** It takes the experiment lock,
+validates committed artifacts, and copies retained output locally. Allow disk
+space for this temporary second copy. Sealing costs local I/O proportional to
+retained output; uploads transfer only new or changed content. Cloud tooling does
+not bypass that contract with hardlinks to mutable live files.
+
+The target recovery window is one interval plus the time needed to reach a safe
+protocol boundary, seal and transfer. A long indivisible step, large initial
+snapshot, slow disk/network, or outage can extend it. The displayed last durable
+recovery timestamp is the reliable boundary. Failed transfers retain the previous
+recovery point, compute continues, and a later interval retries. Cancellation,
+the absolute deadline, and the independent deletion timer still take precedence.
 
 ## Storage and publication
 
+Cloud-owned storage is organized as follows; EWS's internal layout is intentionally
+not specified here:
+
 ```text
 studies/STUDY_ID/
-  environments/ATTEMPT_ID.json       # verified setup environment records
-  commits/ATTEMPT_ID.json            # immutable parent-linked state commits
+  environments/ATTEMPT_ID.json
+  blobs/SHA256
+  snapshots/SNAPSHOT_ID/recovery.json
+  commits/COMMIT_ID.json
   attempts/ATTEMPT_ID/
     manifest.json
-    source/source.tar.gz
-    source/index.json
-    config/experiment-config
-    machine/environment.json
-    machine/pip-freeze.txt
-    machine/runtime.json
+    lifecycle.json
+    source/...
+    config/...
+    machine/...
     logs/...
-    ews-state.json                   # every output file's SHA-256 and mode
-    artifacts/output/...             # COMPLETE EWS output, including restored files
-    artifacts/index.json             # other workspace deltas
-    artifacts/source/...
+    artifacts/...                 # other workspace deltas
 ```
 
-There is no mutable shared `latest` pointer. A single parent-linked head derived
-from `commits/` identifies authoritative state. Missing parents, competing heads,
-cycles, and disconnected histories fail closed. Attempt manifests provide the
-history; `cloud-results list --attempts STUDY_ID` displays it. Full study pulls
-also write a synthesized local study `manifest.json` containing history/head.
+An immutable parent-linked commit selects an EWS snapshot. There may be many
+commits per attempt. Missing parents, competing heads and disconnected histories
+fail closed. No mutable latest pointer decides the winner. Content-addressed
+objects share unchanged bytes across syncs and attempts; EWS's manifest preserves
+paths, empty directories and intentional pruning receipts.
 
-Each successful final publication stores a complete generation of the same
-logical EWS filesystem. This deliberately retains full copies per attempt for
-recovery, rather than mutating one shared output prefix; storage use grows with
-attempt count. All scientific files, including checkpoints, result chunks,
-instances, catalogs, analysis and reports, survive. Empty directories are not S3
-objects and EWS recreates them as needed. Links, special files, or secret-like
-paths in the EWS tree cause publication to fail, never a silently partial state.
-Custom artifact exclusions cannot remove files from the persistent EWS tree.
+Each synchronization:
 
-The worker refreshes the head **after acquiring its VM lease**, restores the
-entire prior generation to `/work/output`, and verifies its inventory checksum,
-all file SHA-256 values, canonical paths, and executable modes. Failed restore
-or setup does not publish state. Finalization stops writers, copies/checks the
-whole tree, uploads/checks the attempt, verifies lease/parent again, then writes
-and reads back its immutable commit. A failed upload retains the previous head;
-the new VM still gets deleted. There is no periodic live checkpoint mirroring:
-a crash/force deletion or failed final upload can lose an entire attempt's new
-progress. Older generations remain available. No automatic pruning/migration or
-remote deletion is performed.
+1. Uses EWS's sealed inventory, with secret-path and regular-file checks.
+2. Uploads newly required content and verifies transferred bytes by downloading
+   for comparison; S3 multipart ETags are not assumed to be SHA-256 hashes.
+3. Publishes and reads back the sealed EWS snapshot manifest.
+4. Rechecks the provider lease and parent. Prunes obsolete committed objects
+   referenced by neither the previous recovery point nor the candidate.
+5. Publishes and reads back the new cloud recovery commit last.
+
+Pruning deliberately lags by one successful synchronization. This preserves the
+previous complete recovery point if deletion or publication is interrupted.
+Trajectory removals are accepted only through EWS's validated inventory, including
+its intentional-pruning receipts and required retained derivations; a missing
+live file alone never authorizes deletion. Unknown orphan uploads are retained
+conservatively. Historical commit metadata survives, but arbitrary older output
+snapshots are not permanent archives. Download results you need to retain before
+later study evolution prunes them. The latest committed snapshot remains complete.
+
+Restore downloads precisely the selected inventory into an isolated directory,
+verifies all hashes and sizes, and invokes EWS's atomic restore into a new output
+tree. It never merges old remote tails into restored output. EWS then performs
+ordinary checkpoint verification/fallback, selection, invalidation and
+rematerialization. A damaged transfer fails before scientific execution.
 
 ## Writer lease and stale recovery
 
-The provider server name is the study ID, while labels identify both study and
-attempt. Hetzner enforces [unique server names within a project](https://docs.hetzner.com/cloud/servers/getting-started/creating-a-server/).
-This atomic provider create is the lease acquisition; object existence or
-timestamp checks are not used as a substitute for compare-and-swap. Concurrent
-launches report an existing attempt or the losing create fails safely. Cleanup
-only discovers/deletes its own attempt ID, never the winner's VM.
+The provider server name is the study ID, with study and attempt labels. Atomic
+unique-name creation acquires the lease. **One Hetzner project must own each
+bucket's study namespace.** Do not share it across independent projects or rename
+or relabel workers. A losing concurrent launch never deletes the winner.
 
-**One Hetzner project must own a bucket's study namespace.** Laptop and worker
-tokens must address that same project. Do not share this bucket namespace among
-independent Cloud projects or rename/relabel managed servers; unique names do
-not coordinate across projects. Workers verify live metadata ID/name/labels
-before restore, environment publication, and state publication. Immutable commits
-also expose a delayed conflicting publication instead of overwriting newer state.
+The worker checks its metadata identity and live provider labels before restore,
+environment publication, recovery publication and pruning. Parent-linked commits
+expose delayed conflicting publications. A deleted VM releases its lease; a
+powered-off or unreachable VM that still exists does not. Never steal a lease
+based on elapsed time. Use cancellation or explicit force deletion, then retry.
 
-A deleted VM automatically releases the lease, regardless of stale `running`
-objects. A powered-off, crashed, or unreachable VM that still exists retains its
-lease; never steal it based on elapsed time. Use normal cancellation/reaper, or
-explicit force deletion as a last resort, then retry. Check provider state when
-deletion credentials are revoked or the provider is unavailable. A VM uniqueness
-collision with an unrelated server is an error; it is never deleted for reuse.
+`cloud-status` and `cloud-results list` derive **interrupted** when stored active
+state has no managed server. Provider lookup failures mean unknown VM state,
+not confirmed absence. Compute completion, last committed recovery, archive
+publication and VM presence are separate columns. Small lifecycle records are
+published independently of payload transfers, including finalization failures
+and deletion requests. A deletion request is not confirmation; provider lookup
+establishes actual absence.
 
 ## Environment recreation and EWS authority
 
-Source is extracted at `/work/source`, EWS at `/work/.ews`, and outputs at
-`/work/output`. Execution uses a normal system-Python venv and
-`ews run CONFIG --output /work/output --portable`. New `cloud-run` requests require
-the standard EWS command. Custom commands remain reproducible in legacy archives
-but do not opt into portable checkpoint guarantees.
+The worker recreates the saved exact Python/runtime and index-package lock before
+restoring output. It installs archived experiment source and the exact EWS commit,
+then reapplies EWS after project dependencies and verifies the resulting lock.
+Unrecreatable local/direct dependencies, missing binary wheels or incompatible
+runtime/package changes fail setup. Use a compatible environment or `--fresh`.
 
-The first successfully prepared environment publishes schema-version-1 JSON:
-`runtime`, exact index `packages`, and `local_projects` with `ews`/`experiment`
-roles. Runtime contains exact Python version/implementation/SOABI, OS family,
-architecture, byte order, pointer width, and libc. Raw editable paths, VCS URLs,
-credentials, and `pip freeze` directives are not lock inputs. Unsupported extra
-direct/local dependencies are rejected. `pip-freeze.txt` remains diagnostic.
+Execution uses `/work/source`, `/work/.ews` and `/work/output`, with the standard
+EWS command plus `--portable --workers N`. N is the available logical CPU count
+reported by the runtime (including CPU affinity), not a provider machine table.
+The override and optional `--timezone` are recorded in execution provenance and
+do not modify YAML or scientific/RNG identity. Portable execution rejects GPU
+and custom checkpoint backends through EWS's own validation.
 
-Later attempts install exact index versions from this lock using binary wheels,
-constrain subsequent installs, install the archived experiment source, and
-reapply the exact requested EWS commit. Runtime is checked before installation;
-the final package set/runtime/local project roles must match before execution.
-Changed local project versions/source are permitted for EWS to evaluate. Missing
-wheels, incompatible new dependencies, Python/architecture/libc drift, or changed
-package sets fail setup clearly. No incompatible checkpoint is loaded; recreate
-the original environment or deliberately use `--fresh`. Environment records
-survive even a setup-complete attempt that later fails before simulation.
+EWS's [portable CPU policy](https://github.com/m1gwings/experiments-wo-stress/blob/d14d5c0fd334140ffd8f64e555a9f7112f274972/docs/PORTABILITY.md)
+retains scientific, dependency and architecture compatibility while excluding
+ephemeral host/kernel/core-count identity. This is not an OS image or a generic
+native-library reproducibility guarantee.
 
-EWS's [portable CPU/NumPy contract](https://github.com/m1gwings/experiments-wo-stress/blob/main/docs/PORTABILITY.md)
-excludes ephemeral hostname/kernel/core-count identity while retaining exact
-runtime/numerical-package, architecture, scientific/source/input, recording,
-budget, and checkpoint validation. Changed source/config/EWS restores the same
-output tree, then EWS selects compatible retained variants or creates new ones.
-Cloud tooling never parses or bypasses checkpoint compatibility itself. GPU and
-custom checkpoint backends are rejected. This is not a frozen OS image or a
-bitwise BLAS/wheel-build reproducibility guarantee. Stronger native numerical
-requirements remain the study author's responsibility.
+## Finalization and bounded cleanup
 
-The laptop avoids compute only when the committed head records successful EWS
-completion and an exact request fingerprint matches all source index bytes,
-source/config provenance, EWS commit/repository, run settings, image family,
-portability policy, and tool version. Machine/runtime are excluded. Unknown
-completion counts, changed inputs, or setup/failure/timeout/cancel status cannot
-claim completion. Otherwise EWS inspects restored work on a new VM.
+Finalization first publishes compute/finalizing metadata, stops setup and the
+periodic supervisor, requests a safe EWS boundary (90-second grace), then stops
+the experiment cgroup (20-second systemd stop allowance). After EWS stops it uses
+the same incremental recovery mechanism one final time. It uploads remaining
+logs, provenance and other workspace deltas, then publishes final state.
+There is no second EWS output copy or duplicate remote output archive beyond the
+local sealed copy required by EWS v1.
 
-## Timeout and cancellation
-
-Finalization stops setup first, requests SIGINT to the EWS coordinator through an
-unprivileged process wrapper, and waits up to **90 seconds** for safe checkpointing.
-It then stops the experiment cgroup with a **20-second** systemd stop allowance
-before forced termination. A verified stopped cgroup is required before copying
-the output. EWS owns safe protocol-step boundaries and checkpoint fallback;
-forced termination may lose work since the previous committed checkpoint.
-
-The attempt retains `timeout` or `cancelled`, uploads complete partial state,
-sends best-effort Discord lifecycle notification, and deletes the VM. EWS's own
-progress notifications/PTY dashboard remain supported. Finalization has a
-12-minute service limit, bounded upload/verification calls, OnFailure deletion,
-and an independent original-deadline-plus-15-minute reaper. Upload failure never
-keeps a VM alive indefinitely. Provider/guest outages and revoked deletion
-credentials still require intervention, as in the existing cleanup guarantees.
+EWS completion is distinct from successful final archive publication. Failure
+records keep that distinction and the last durable recovery point. The finalizer
+still has a 12-minute service limit, OnFailure deletion, and an independent
+original-deadline-plus-15-minute reaper. The deletion service can publish a small
+failure/deletion record even if the finalizer was killed during a large transfer.
+No upload failure keeps compute alive indefinitely. Provider outages or revoked
+deletion credentials still require intervention; powered-off VMs remain billable.
 
 ## Browsing and reproduction
 
-`cloud-status`, `cloud-attach`, and `cloud-cancel` accept study or attempt IDs.
-`cloud-results list` shows logical studies and legacy runs; `list --attempts
-STUDY_ID` shows history. `ls STUDY_ID` lists the full hierarchy. Plain `pull
-STUDY_ID` and `sync` archive every attempt; `pull ATTEMPT_ID` archives one.
-Semantic selectors on a study use only its committed head's EWS `artifacts.json`;
-on an attempt they use that attempt's catalog. `--path` is literal relative to
-the supplied ID's root; use `ls` instead of remembering paths. Progress/non-TTY
-behavior and download markers are unchanged.
+Use `cloud-results list`, `cloud-status STUDY_ID`, then `cloud-results pull
+STUDY_ID --plots` or plain `pull` for the complete current bundle. Result commands
+materialize committed EWS output beneath `artifacts/output` from shared objects.
+`ls` presents these logical paths; semantic selectors use EWS's artifact catalog.
+Full study pulls include attempt inputs, provenance and logs plus current output,
+without downloading the entire historical object pool. Earlier pruned attempt
+output is explicitly unavailable, rather than silently presented as complete.
 
-Legacy `runs/RUN_ID` is read without reinterpretation. Legacy outputs without an
-EWS semantic catalog still require `--path`; no guessed figure/report mapping.
-There is no automatic migration of their state into new default studies.
-
-`cloud-reproduce ID` creates an independent lineage from archived source/config,
-exact EWS revision/settings, and its verified environment lock when available.
-It never restores the original EWS output. Old archives without portable support
-keep their original command/strict behavior and have no portable promise or
-environment lock. Ordinary continuation always uses `cloud-run`, optionally
-`--study` for an explicit fresh/reproduction lineage.
-
-## Manual validation (billable; never run by automated tests)
-
-From the experiment repository, use its exact EWS pin and a config long enough
-to exceed setup plus the chosen runtime:
-
-```bash
-cloud-run configs/cloud_grid.yml --machine cpx52 --max-runtime 0.25 --ews-ref FULL_EWS_COMMIT
-cloud-results list --attempts STUDY_ID
-cloud-status STUDY_ID
-# After timeout, verified publication and VM deletion, repeat the identical launch:
-cloud-run configs/cloud_grid.yml --machine cpx52 --max-runtime 0.25 --ews-ref FULL_EWS_COMMIT
-```
-
-Check first-attempt status/upload and its `commits/` entry before repeating.
-If setup consumed the whole deadline, increase the per-attempt runtime until
-EWS actually starts. Confirm the next attempt logs verified restore and EWS
-reports compatible reuse/checkpoint progress. Completed unchanged studies skip
-compute. Tests use fake provider trees and local rclone directories only.
+`cloud-reproduce ID` creates an independent lineage from archived inputs, exact
+EWS revision/settings and environment lock, without restoring its old output.
+Legacy archives remain readable. Every reproduction checks its archived exact
+EWS commit against the supported recovery contract before creating compute;
+unsupported legacy pins and custom legacy commands fail explicitly. Reproduce
+those archives locally, or deliberately start a new cloud run with a compatible
+EWS pin and standard command. Neither
+retrieval nor tests execute downloaded research code or launch cloud VMs.

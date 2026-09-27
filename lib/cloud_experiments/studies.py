@@ -44,28 +44,63 @@ def attempt_study(attempt):
 
 
 def request_key(manifest, index):
-    """Exact completion shortcut; all source bytes/settings count, machine/runtime do not."""
+    """Exact completion shortcut, excluding display and operational allocations."""
+    settings = {key: value for key, value in manifest["settings"].items()
+                if key not in ("sync_seconds", "timezone", "ews_discord")}
     return digest({"source": index, "experiment": manifest["experiment"], "config": manifest["config"], "ews": manifest["ews"]["commit"],
-                   "ews_repository": manifest["ews"]["repository"], "settings": manifest["settings"],
+                   "ews_repository": manifest["ews"]["repository"], "settings": settings,
                    "image": manifest["image"], "tool_version": manifest["tool_version"],
                    "portable_continuation": manifest.get("portable_continuation", True)})
 
 
-def state_head(study, commits):
-    """Require a single verified lineage; never silently choose between competing heads.
+def state_head(study, commits, *, allow_legacy=False):
+    """Validate one parent-linked lineage and reject incompatible recovery state.
 
-    VM uniqueness serializes live writers. Immutable parent-linked commits also
-    expose a delayed publication after provider deletion as a conflict, rather
-    than allowing an old upload to overwrite a newer mutable pointer.
+    Schema 2 permits multiple durable commits per attempt. Schema 1 remains
+    readable for archival listings only; continuation requires a fresh lineage.
     """
+    from .ews_contract import validate_contract
+
     by_id = {}
+    if any(not isinstance(commit, dict) or type(commit.get("schema_version")) is not int
+           for commit in commits):
+        raise Error("Invalid cloud recovery state contract.")
+    versions = {commit["schema_version"] for commit in commits}
+    if versions and versions != {2} and not (allow_legacy and versions == {1}):
+        raise Error("Unsupported cloud recovery state contract; preserve the archive and use --fresh.")
+    legacy = versions == {1}
     for commit in commits:
         aid = commit.get("attempt_id")
-        if (commit.get("schema_version") != 1 or commit.get("study_id") != study
-                or not isinstance(aid, str) or attempt_study(aid) != study
-                or aid in by_id or not re.fullmatch(r"[0-9a-f]{64}", commit.get("inventory_sha256", ""))):
+        identifier = aid if legacy else commit.get("commit_id")
+        checksum = commit.get("inventory_sha256") if legacy else commit.get("recovery_sha256")
+        if (commit.get("study_id") != study or not isinstance(aid, str)
+                or attempt_study(aid) != study or not isinstance(identifier, str)
+                or identifier in by_id or not isinstance(checksum, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", checksum)):
             raise Error("Invalid or duplicate study state commit.")
-        by_id[aid] = commit
+        if not legacy:
+            if (not re.fullmatch(r"[0-9a-f]{32}", identifier)
+                    or not isinstance(commit.get("snapshot_id"), str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", commit["snapshot_id"])
+                    or not isinstance(commit.get("committed_at"), str)
+                    or type(commit.get("final")) is not bool
+                    or type(commit.get("completed")) is not bool):
+                raise Error("Invalid cloud recovery commit metadata.")
+            validate_contract(commit.get("contract"))
+            provenance = commit.get("provenance")
+            if not isinstance(provenance, dict):
+                raise Error("Recovery commit is missing tooling provenance.")
+            ews = provenance.get("ews", {})
+            cloud = provenance.get("cloud", {})
+            if (not isinstance(ews, dict) or not isinstance(ews.get("commit"), str)
+                    or not re.fullmatch(r"[0-9a-f]{40}", ews["commit"])
+                    or not isinstance(cloud, dict) or not isinstance(cloud.get("version"), str)
+                    or not cloud["version"]):
+                raise Error("Recovery commit is missing exact EWS/cloud tooling provenance.")
+        parent = commit.get("parent")
+        if parent is not None and not isinstance(parent, str):
+            raise Error("Invalid study recovery parent.")
+        by_id[identifier] = commit
     if not by_id:
         return None
     parents = [c.get("parent") for c in commits if c.get("parent") is not None]
@@ -75,10 +110,10 @@ def state_head(study, commits):
     head = by_id[next(iter(heads))]
     seen, current = set(), head
     while current:
-        aid = current["attempt_id"]
-        if aid in seen:
+        identifier = current["attempt_id"] if legacy else current["commit_id"]
+        if identifier in seen:
             raise Error("Cyclic study state history.")
-        seen.add(aid)
+        seen.add(identifier)
         parent = current.get("parent")
         if parent is not None and parent not in by_id:
             raise Error("Incomplete study state history; a parent commit is missing.")

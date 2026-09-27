@@ -1,4 +1,6 @@
+import base64
 import contextlib
+import gzip
 import io
 import json
 import os
@@ -29,6 +31,12 @@ bucket = "test-bucket"
 repository = "https://github.com/example/ews.git"
 default_ref = "main"
 '''
+
+
+def decode_cloud_file(entry):
+    """Decode the cloud-init write_files encoding actually supplied by bootstrap."""
+    content = base64.b64decode(entry['content'])
+    return gzip.decompress(content) if entry['encoding'] == 'gz+b64' else content
 
 
 def sample_config(root):

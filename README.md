@@ -1,8 +1,10 @@
 # cloud-experiments
 
 Reusable commands for disposable Hetzner research workers: freeze your experiment
-source, pin EWS, run in tmux, save results to Object Storage, and delete the VM.
-Repeated `cloud-run CONFIG` restores and continues the same logical EWS study.
+source, pin EWS, run in tmux, periodically persist recovery to Object Storage,
+and delete the VM. Cloud CPU execution uses all available logical workers.
+Repeated `cloud-run CONFIG` restores the latest committed recovery and continues
+the same logical EWS study, including after VM loss.
 Machine and runtime settings belong to each attempt, not the study identity.
 See [automatic continuation](docs/continuation.md) for storage, locking, and compatibility.
 There is no project-specific experiment code, Docker, database, or hosted service.
@@ -35,10 +37,10 @@ project, `nbg1`, and `migwings-experiments` bucket described there.
 | `cloud-run CONFIG` | Continue the repository/config study; restore verified state, or skip compute if exactly completed. |
 | `cloud-results list --attempts STUDY_ID` | Inspect all attempts of a logical study. |
 | `cloud-attach RUN_ID` | Attach to the active experiment's tmux terminal. |
-| `cloud-status [RUN_ID]` | Show managed active VMs, or a stored manifest for a completed run. |
-| `cloud-results list` | Read remote manifests, including failed and incomplete runs. |
+| `cloud-status [RUN_ID]` | Show compute, recovery, archive and VM state; absent active workers are `interrupted`. |
+| `cloud-results list` | Show stored studies with current VM presence and separate persistence outcomes. |
 | `cloud-results ls RUN_ID [--json]` | Recursively list remote file paths and sizes without downloading contents. |
-| `cloud-results pull RUN_ID [--dest PATH]` | Download a full study (all attempts), attempt, or legacy run, by default to `~/cloud-results/RUN_ID`. |
+| `cloud-results pull RUN_ID [--dest PATH]` | Download study inputs/history/current output, an attempt, or a legacy run, by default to `~/cloud-results/RUN_ID`. |
 | `cloud-results pull RUN_ID --plots` | Resolve the EWS `figures` role; succeed with an explanation if optional files are absent. |
 | `cloud-results pull RUN_ID --analysis` | Resolve the EWS `analysis` role; does not execute analysis. |
 | `cloud-results pull RUN_ID --report` | Resolve the EWS `compute_report` role. |
@@ -127,14 +129,20 @@ command = ["ews", "run", "{config}", "--output", "{output}"]
 install_experiment = "auto"  # or "never"
 artifact_exclude = []
 ews_discord = false         # optional EWS progress messages; see below
+sync_seconds = 300          # periodic recovery interval
+# timezone = "Europe/Rome" # display override; "UTC" explicitly selects server UTC
 ```
 
 This is an argument array, not a shell snippet. `{config}` is the config's
 repository-relative path; `{output}` is `/work/output`. Execution starts in
 `/work/source` with the virtual environment on `PATH`. Automatic continuation
-requires this standard EWS argument array and adds `--portable`. GPU/custom
-checkpoint backends are unsupported; old custom commands remain archived and
-reproducible with their original strict behavior. The first prepared environment
+requires this standard EWS argument array and adds `--portable --workers N`, where
+N is the available logical CPU count discovered on the worker. The YAML worker
+count is an operational local default; cloud execution overrides it without
+changing scientific identity or RNG behavior. An optional `run.timezone` is
+validated by EWS and forwarded as `--timezone`. GPU/custom
+checkpoint backends are unsupported. Old custom-command archives remain readable;
+new reproductions require the standard command and supported EWS contract. The first prepared environment
 locks exact runtime and index package versions. Subsequent attempts recreate and
 validate that lock before EWS can load checkpoints. See
 [continuation compatibility](docs/continuation.md#environment-recreation-and-ews-authority).
@@ -164,7 +172,10 @@ format and permissions. No per-run export or URL in the experiment repo is
 needed. Each EWS study must enable `notifications.discord` and use
 `webhook_env: EWS_DISCORD_WEBHOOK_URL`; its YAML controls the message interval.
 Cloud forwarding does not rewrite the YAML or enable EWS notifications itself.
-Both channels can use the same Discord webhook.
+Both channels can use the same Discord webhook. EWS notifications describe compute;
+cloud messages separately identify last durable recovery, archive publication and
+VM deletion requests. A compute-completed message does not claim an archive or
+confirmed VM deletion.
 
 `run.ews_discord` defaults to `false`. With it enabled, a missing webhook fails
 before any input upload or VM creation. Launch validates presence and URL syntax;
@@ -195,55 +206,42 @@ for the following attempt archive, with parent-linked state commits and environm
 locks beside `attempts/`. See the [complete layout](docs/continuation.md#storage-and-publication).
 Legacy `runs/RUN_ID/` remains readable without migration.
 
-Attempt archive:
+Every attempt archives immutable inputs, logs, environment and runtime provenance,
+plus other generated workspace artifacts. EWS output is stored as shared verified
+recovery objects; downloads materialize its normal tree under `artifacts/output`.
+This avoids duplicating a many-GB output for every sync or attempt. Full study
+pulls retain attempt inputs/logs and the latest committed output. Historical
+recovery metadata remains, but intentionally pruned old output is not a permanent
+archive. Download any historical bytes you need to keep.
 
-```text
-hetzner:migwings-experiments/studies/STUDY_ID/attempts/ATTEMPT_ID/
-  manifest.json
-  source/source.tar.gz
-  source/index.json
-  config/experiment-config
-  artifacts/index.json
-  artifacts/source/...       # new/modified files under the source tree
-  artifacts/output/...       # complete EWS output including restored checkpoints
-  ews-state.json             # all output file SHA-256 values and modes
-  artifacts/home/...         # generated files under HOME/TMPDIR
-  artifacts/...              # other new/modified files anywhere under /work
-  logs/setup.log
-  logs/console.log           # combined PTY stdout/stderr, including terminal codes
-  logs/worker.log            # when setup/execution fails
-  machine/runtime.json
-  machine/pip-freeze.txt
-  machine/environment.json   # recreatable exact runtime/package lock
-```
+Manifests record the exact experiment and EWS commits, source/config checksums,
+EWS cloud-contract version, cloud implementation version/revision/content digest,
+executed arguments and worker allocation, machine, timestamps, and separate
+compute, recovery, archive and deletion outcomes. Inputs are verified before
+compute creation. Unknown recovery contracts and legacy continuation state fail
+closed; old result archives remain readable.
 
-The manifest records repository/commit/dirty state; source and config SHA-256;
-requested and exact EWS revision; execution arguments; VM type/location/image;
-server identity; UTC timestamps/deadline; Python/OS/machine information; status,
-exit code (null if unavailable), elapsed seconds, and upload verification.
-Missing runtime fields mean setup had not reached that stage. Inputs and a
-`provisioning` manifest are uploaded and checked before compute creation. The
-worker publishes `running` before launch and a final `completed`, `failed`,
-`cancelled`, `timeout`, or `setup_failed` manifest after uploading artifacts.
+Recovery normally runs every five minutes. The supported EWS recovery v1 API
+requires a graceful pause and a sealed local copy; compute resumes before the
+incremental network transfer. The first sync can be large, and long protocol
+steps or storage outages extend the window. Use the last durable recovery time
+to see what is protected. Finalization uses the same sync mechanism once more,
+then publishes the final archive state. A failed upload retains the preceding
+recovery and never postpones deletion indefinitely. See
+[the recovery protocol and its limits](docs/continuation.md).
 
-The entire EWS output is preserved independently of exclusions or deltas. Other
-artifact collection compares file content and executable bits with the initial
-snapshot. It also captures new files throughout `/work`, regardless of extension
-or expected output directory. Deleted source paths and excluded paths are
-recorded in `artifacts/index.json`; symlinks are never followed. Git, environments,
-dependency caches, worker control files, and secret-like paths are excluded.
-Custom `artifact_exclude` globs are relative to `/work` (e.g.
-`"source/scratch/*"`) and persisted in the manifest. Avoid excluding outputs you
-want to keep. Write persistent data under `/work`: explicit writes to `/tmp` or
-other paths outside this workspace are not captured. No remote deletes or
-destructive rclone sync operations are used for result retrieval.
+EWS intentionally pruned trajectories are eventually removed remotely only after
+replacement state is verified, while preserving the preceding recovery point.
+Other artifact collection captures new/modified regular files under `/work`,
+compared with the initial source snapshot. Dependency/control/secret-like paths
+and configured `artifact_exclude` globs are excluded; links are never followed.
+Write persistent output under `/work`; arbitrary paths elsewhere are not captured.
 
-`cloud-results sync` compares remote final manifests to local download markers;
-running runs are refreshed using rclone's incremental copy behavior. Remove a
-run's `.cloud-pulled.json` marker, or use `pull`, to restore deleted local files.
-A pull never executes downloaded research code; `--analysis` selects stored files
-only. Selective downloads do not mark a run fully downloaded, so a later `sync`
-still retrieves its full archive.
+`cloud-results sync` compares final manifests to local full-download markers;
+active runs refresh incrementally. Remove `.cloud-pulled.json` or use `pull` to
+restore deleted local files. Selective pulls never mark a bundle fully downloaded
+and never execute analysis or downloaded research code. Retrieval never deletes
+remote objects.
 
 ## Inspect remote results and download selected files
 
@@ -256,8 +254,8 @@ cloud-results ls RUN_ID
 cloud-results ls RUN_ID --json
 ```
 
-`ls` recursively reads names and sizes from Object Storage, without downloading
-file contents, creating local result directories, or contacting a VM. Paths are
+`ls` reads object names, sizes and committed recovery inventory metadata, without
+downloading output payloads, creating local result directories, or contacting a VM. Paths are
 relative to the run root and sorted by path. Interactive output has a size/path
 table with human-readable sizes. Redirected output is headerless TSV,
 `BYTES<TAB>PATH`, with integer byte counts; `--json` always emits an array of
@@ -282,7 +280,7 @@ or legacy ID, they discover the single `artifacts.json` under captured `artifact
 and resolve paths relative to its parent. EWS owns these paths; cloud-experiments
 has no mapping of EWS internal figure/analysis/report locations. The small
 catalog is fetched in addition to the file listing; unrelated result contents
-are not downloaded. `ls` itself remains names/sizes only.
+are not downloaded. `ls` reads recovery metadata to expose logical output paths.
 
 The supported [EWS contract](https://github.com/m1gwings/experiments-wo-stress/blob/main/docs/ARTIFACTS.md)
 is `schema: "experiments-wo-stress/artifacts"`, integer `schema_version: 1`, and
@@ -298,7 +296,7 @@ an explanation and no download. A missing required artifact fails.
 RUN_ID` to choose the literal stored file/subtree. No legacy layout is silently
 assumed. Use `--path` for ambiguous multiple EWS outputs or arbitrary artifacts
 as well. A newer EWS checkout cannot retrofit an already uploaded legacy run.
-Full pulls and listing work independently of EWS metadata. Support is detected
+Legacy full pulls and listing work without an EWS artifact catalog. Support is detected
 per run, never from a globally required EWS Git SHA; the cloud run manifest still
 records the exact EWS commit for provenance and reproduction.
 
@@ -355,8 +353,8 @@ It never restores old output; ordinary continuation uses repeated `cloud-run`. I
 consult today's experiment Git checkout or resolve EWS `main` again. It uses the
 current laptop's storage destination, SSH key, and worker credentials. Dirty runs
 are reproduced from their stored bytes. Modern attempts also recreate their saved
-exact environment lock. Legacy archives without a lock retain their original
-strict command and dependency limitations. This does not freeze an OS image or
+exact environment lock. Legacy archives remain readable, but reproduction rejects unsupported EWS pins
+or custom commands before creating compute. This does not freeze an OS image or
 provide generic native/GPU portability. Deletion of the public EWS repository/commit remains a limitation.
 
 ## Cleanup and security
@@ -364,8 +362,8 @@ provide generic native/GPU portability. Deletion of the public EWS repository/co
 The first-boot cloud-init payload installs deadline and last-resort timers before
 package installation or source transfer. The deadline includes setup time. At the
 deadline the worker stops setup, requests graceful EWS interruption for up to
-90 seconds, then stops its cgroup (20 seconds before forced kill), collects outputs,
-uploads/checks them, publishes a final manifest, optionally notifies Discord, and
+90 seconds, then stops its cgroup (20 seconds before forced kill), performs a final
+incremental recovery sync and archive upload, publishes lifecycle state, and
 requests its own deletion. Upload failures are recorded when possible and **never
 prevent deletion**. Finalization is bounded; the separate reap timer starts API
 deletion at deadline + 15 minutes even if finalization is stuck. Deletion retries
@@ -402,7 +400,8 @@ kernel is frozen, credentials are revoked, or the Hetzner API is unavailable.
 The CLI reports unconfirmed cleanup prominently. Check `cloud-status` and the
 Hetzner Console if anything looks wrong. **Powered-off VMs still incur charges;
 successful deletion is what stops compute billing.** A failed upload can leave a
-stale `running` manifest or partial data despite successful deletion.
+stale stored `running` manifest despite successful deletion; status derives
+`interrupted` from the absent VM and shows the last durable recovery separately.
 
 ## Development
 

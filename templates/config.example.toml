@@ -12,7 +12,7 @@ bucket = "migwings-experiments"
 
 [ews]
 repository = "https://github.com/m1gwings/experiments-wo-stress.git"
-default_ref = "main"
+default_ref = "d14d5c0fd334140ffd8f64e555a9f7112f274972" # inspected EWS recovery v1 producer
 
 # Optional. Commands are argument arrays, never shell snippets.
 [run]
@@ -20,6 +20,9 @@ command = ["ews", "run", "{config}", "--output", "{output}"]
 install_experiment = "auto" # requirements.txt, then editable project if present
 artifact_exclude = [] # globs relative to /work; recorded in every manifest
 ews_discord = false # set true once to forward worker.env's Discord webhook to EWS
+sync_seconds = 300 # request a safe recovery boundary every five minutes
+# timezone = "Europe/Rome" # optional EWS display override; "UTC" is explicit server UTC
+# CPU workers use the VM's available logical CPUs, overriding execution.workers in YAML.
 
 # All paths support ~. XDG_CONFIG_HOME and XDG_STATE_HOME are honored by defaults.
 # [local]
