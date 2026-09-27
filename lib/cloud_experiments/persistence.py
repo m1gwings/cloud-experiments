@@ -105,8 +105,11 @@ def download_files(call, root, recovery, destination, paths):
         selection = temporary / "blobs.txt"
         selection.write_text("".join(digest + "\n" for digest in sorted(digests)))
         pool = temporary / "blobs"
+        # Direct lookups are faster for a few selected results; large recovery
+        # inventories are faster when the blob pool is listed and filtered once.
+        listing = ["--no-traverse"] if len(digests) <= 256 else ["--fast-list"]
         call("copy", root + "/blobs", str(pool), "--files-from", str(selection),
-             "--no-traverse", "--transfers", "16", timeout=7200)
+             *listing, "--transfers", "16", timeout=7200)
         for digest, size in digests.items():
             blob = pool / digest
             if blob.is_symlink() or not blob.is_file() or blob.stat().st_size != size or sha256(blob) != digest:

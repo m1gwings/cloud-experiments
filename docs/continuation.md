@@ -115,8 +115,10 @@ atomic restore into a new output tree. It never merges old remote tails into
 restored output. EWS then performs
 ordinary checkpoint verification/fallback, selection, invalidation and
 rematerialization. A damaged transfer fails before scientific execution.
-Large recoveries can contain many small blobs. The download has a two-hour
-limit, and the launcher waits up to three hours for setup and restore (or the
+Large recoveries can contain many small blobs. Restore lists the blob pool once
+and filters it to the committed inventory, avoiding a lookup for each blob;
+small result selections use direct lookups. The download has a two-hour limit,
+and the launcher waits up to three hours for setup and restore (or the
 attempt's shorter runtime limit). Both are ceilings, not delays; the attempt
 still has its original deadline and setup time counts toward it.
 

@@ -296,6 +296,27 @@ class RecoveryTests(unittest.TestCase):
             self.restored()
         self.assertFalse((self.root / 'replacement/work/output').exists())
 
+    def test_large_download_lists_once_and_restores_only_selected_blobs(self):
+        root = self.remote_root()
+        pool = root / 'blobs'
+        pool.mkdir(parents=True)
+        files = {}
+        for index in range(300):
+            payload = f'blob {index}'.encode()
+            digest = hashlib.sha256(payload).hexdigest()
+            (pool / digest).write_bytes(payload)
+            files[f'runs/{index:03d}.bin'] = {'sha256': digest, 'size': len(payload)}
+        (pool / hashlib.sha256(b'unrelated').hexdigest()).write_bytes(b'unrelated')
+        destination = self.root / 'large-download'
+        persistence.download_files(self.storage, remote_path(self.manifest['storage'], self.manifest['study_id']),
+                                   {'files': files}, destination, files)
+        copies = [args for args in self.storage.events if args[0] == 'copy' and str(args[1]).endswith('/blobs')]
+        self.assertEqual(len(copies), 1)
+        self.assertIn('--fast-list', copies[0])
+        self.assertNotIn('--no-traverse', copies[0])
+        self.assertEqual((destination / 'runs/299.bin').read_bytes(), b'blob 299')
+        self.assertEqual(len(list(destination.rglob('*.bin'))), 300)
+
     def test_unknown_cloud_and_ews_contract_versions_fail_closed(self):
         commit = self.sync()
         for field, value in [('schema_version', 3), ('contract', {'schema': ews_contract.SCHEMA, 'schema_version': 2})]:
