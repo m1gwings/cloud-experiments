@@ -21,6 +21,9 @@ for dist in distributions():
         local[name] = {"source": roots[origin["url"]], "version": dist.version}
     else:
         packages[name] = dist.version
+# Editable source metadata can appear twice; the local project wins.
+for name in local:
+    packages.pop(name, None)
 print(json.dumps({"schema_version": 1, "runtime": {"python": platform.python_version(),
     "implementation": platform.python_implementation(), "abi": sysconfig.get_config_var("SOABI"),
     "system": platform.system(), "machine": platform.machine().lower(), "byteorder": sys.byteorder,
@@ -45,18 +48,27 @@ def validate(lock):
                 or set(project) != {"source", "version"} or project["source"] not in ("ews", "experiment")
                 or not isinstance(project["version"], str)):
             raise Error("Invalid local project in continuation environment.")
+        if name in lock["packages"] and lock["packages"][name] != project["version"]:
+            raise Error("Conflicting local and index package versions in continuation environment.")
     return lock
 
 
-def constraints(lock):
+def index_packages(lock):
     validate(lock)
-    return "".join(f"{name}=={version}\n" for name, version in sorted(lock["packages"].items()))
+    # Older locks may record an editable project twice. It is rebuilt from the
+    # archived source, so never ask the package index to supply that duplicate.
+    return {name: version for name, version in lock["packages"].items()
+            if name not in lock["local_projects"]}
+
+
+def constraints(lock):
+    return "".join(f"{name}=={version}\n" for name, version in sorted(index_packages(lock).items()))
 
 
 def verify(expected, actual):
     validate(expected)
     validate(actual)
-    if expected["runtime"] != actual["runtime"] or expected["packages"] != actual["packages"]:
+    if expected["runtime"] != actual["runtime"] or index_packages(expected) != index_packages(actual):
         raise Error("Continuation environment differs from the saved runtime/package lock. No EWS checkpoint was loaded; recreate the environment or use --fresh.")
     # New archived scientific source/EWS may have new project versions. EWS's
     # source and environment fingerprints select new variants in that case.

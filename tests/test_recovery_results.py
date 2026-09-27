@@ -82,6 +82,10 @@ class RecoveryResultTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             cli.pull_selection(self.storage, self.config, self.study, destination=destination, role="figures")
         self.assertEqual((destination / "artifacts/output/exports/charts/new.pdf").read_bytes(), b"new")
+        downloads = [args for args in self.calls if args[0] == 'copy' and str(args[1]).endswith('/blobs')]
+        self.assertEqual(len(downloads), 1)
+        self.assertIn('--files-from', downloads[0])
+        self.assertIn('--no-traverse', downloads[0])
         self.assertEqual(self.storage.study_manifest(self.study)["last_recovery"]["commit_id"], latest["commit_id"])
 
     def test_full_pull_replaces_output_without_copying_blob_pool_and_keeps_attempt_logs(self):

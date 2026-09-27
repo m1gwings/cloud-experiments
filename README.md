@@ -232,6 +232,10 @@ recovery and never postpones deletion indefinitely. See
 
 EWS intentionally pruned trajectories are eventually removed remotely only after
 replacement state is verified, while preserving the preceding recovery point.
+Recovery history reads only commit and environment records; pruning checks each
+obsolete blob directly, so neither step lists the whole growing result pool.
+Continuation fetches the sealed blob inventory in one bounded parallel transfer,
+then checks every size and SHA-256 before starting EWS.
 Other artifact collection captures new/modified regular files under `/work`,
 compared with the initial source snapshot. Dependency/control/secret-like paths
 and configured `artifact_exclude` globs are excluded; links are never followed.

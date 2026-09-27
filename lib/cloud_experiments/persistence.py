@@ -25,7 +25,12 @@ from . import ews_contract
 
 
 def _read_history(call, root, study):
-    entries = json.loads(call("lsjson", root, "--recursive", "--files-only", timeout=120).stdout)
+    # Commit and environment records are flat prefixes. Listing the study root
+    # also walks every content-addressed result blob and can time out at scale.
+    entries = []
+    for prefix in ("commits", "environments"):
+        listed = json.loads(call("lsjson", root + "/" + prefix, "--files-only", timeout=120).stdout)
+        entries.extend({"Path": prefix + "/" + entry["Path"]} for entry in listed)
     commits, environments = [], []
     for entry in entries:
         name = valid_result_path(entry["Path"])
@@ -76,23 +81,46 @@ def read_snapshot(call, root, commit):
 
 
 def download_files(call, root, recovery, destination, paths):
-    """Materialize selected output bytes, verifying every content-addressed object."""
+    """Batch-fetch exact blobs, verify all bytes, then materialize selected output."""
     destination = Path(destination)
+    paths = list(paths)
+    if not paths:
+        return
+    digests = {}
     for name in paths:
         if valid_result_path(name) != name or name not in recovery["files"]:
             raise Error("File is absent from the committed EWS recovery inventory.")
         descriptor = recovery["files"][name]
+        digest, size = descriptor["sha256"], descriptor["size"]
+        if digest in digests and digests[digest] != size:
+            raise Error("Inconsistent size for a committed recovery blob.")
+        digests[digest] = size
         target = destination / name
         for parent in (target, *target.parents):
             if parent.is_symlink():
                 raise Error("Recovery destination contains a symlink.")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(prefix=".download-", dir=target.parent) as temporary:
-            partial = Path(temporary) / "payload"
-            call("copyto", root + "/blobs/" + descriptor["sha256"], str(partial), timeout=360)
-            if partial.stat().st_size != descriptor["size"] or sha256(partial) != descriptor["sha256"]:
+    destination.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".download-", dir=destination) as temporary:
+        temporary = Path(temporary)
+        selection = temporary / "blobs.txt"
+        selection.write_text("".join(digest + "\n" for digest in sorted(digests)))
+        pool = temporary / "blobs"
+        call("copy", root + "/blobs", str(pool), "--files-from", str(selection),
+             "--no-traverse", "--transfers", "16", timeout=1800)
+        for digest, size in digests.items():
+            blob = pool / digest
+            if blob.is_symlink() or not blob.is_file() or blob.stat().st_size != size or sha256(blob) != digest:
                 raise Error("Restored EWS state failed SHA-256 verification; no experiment was started.")
-            os.replace(partial, target)
+        for name in paths:
+            target = destination / name
+            for parent in (target, *target.parents):
+                if parent.is_symlink():
+                    raise Error("Recovery destination contains a symlink.")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(prefix=".write-", dir=target.parent) as writing:
+                partial = Path(writing) / "payload"
+                shutil.copyfile(pool / recovery["files"][name]["sha256"], partial)
+                os.replace(partial, target)
 
 
 def download_snapshot(call, root, commit, directory):
@@ -219,11 +247,11 @@ def _prune(worker, root, commits, head, retained):
     if predecessor is None:
         return
     obsolete = _digests(read_snapshot(worker.rclone, root, predecessor)) - retained
-    entries = json.loads(worker.rclone("lsjson", root, "--recursive", "--files-only", timeout=120).stdout)
-    present = {entry["Path"].removeprefix("blobs/") for entry in entries
-               if entry["Path"].startswith("blobs/")}
-    for digest in sorted(obsolete & present):
-        worker.rclone("deletefile", root + "/blobs/" + digest, timeout=60)
+    for digest in sorted(obsolete):
+        blob = root + "/blobs/" + digest
+        entry = json.loads(worker.rclone("lsjson", blob, "--stat", timeout=30).stdout)
+        if not entry.get("IsDir") and entry.get("Path") == digest:
+            worker.rclone("deletefile", blob, timeout=60)
 
 
 def sync(worker, manifest, snapshot=None, final=False):
@@ -268,8 +296,8 @@ def sync(worker, manifest, snapshot=None, final=False):
                         raise Error("Sealed recovery payload changed before synchronization.")
                     os.link(source, target)
             if any(transfer.iterdir()):
-                worker.rclone("copy", str(transfer), root + "/blobs", "--ignore-times", timeout=360)
-                worker.rclone("check", str(transfer), root + "/blobs", "--one-way", "--download", timeout=360)
+                worker.rclone("copy", str(transfer), root + "/blobs", "--ignore-times", timeout=1800)
+                worker.rclone("check", str(transfer), root + "/blobs", "--one-way", "--download", timeout=1800)
         # The EWS marker is published only after all of its payload is verified.
         marker = root + "/snapshots/" + recovery["snapshot_id"] + "/recovery.json"
         worker.rclone("copyto", str(snapshot / "recovery.json"), marker, timeout=45)

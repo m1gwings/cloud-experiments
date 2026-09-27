@@ -51,9 +51,13 @@ class LocalStorage:
         source = self.path(args[1])
         data = b''
         if operation == 'lsjson':
-            data = json.dumps([{'Path': p.relative_to(source).as_posix(), 'Name': p.name,
-                                'IsDir': False, 'Size': p.stat().st_size}
-                               for p in sorted(source.rglob('*')) if p.is_file()]).encode()
+            if '--stat' in args:
+                entry = {'Path': source.name, 'IsDir': False} if source.is_file() else {'Path': '', 'IsDir': True}
+                data = json.dumps(entry).encode()
+            else:
+                data = json.dumps([{'Path': p.relative_to(source).as_posix(), 'Name': p.name,
+                                    'IsDir': False, 'Size': p.stat().st_size}
+                                   for p in sorted(source.rglob('*')) if p.is_file()]).encode()
         elif operation == 'cat':
             data = source.read_bytes()
         elif operation == 'copyto':
@@ -62,7 +66,9 @@ class LocalStorage:
             shutil.copyfile(source, destination)
         elif operation == 'copy':
             destination = self.path(args[2])
-            for path in source.rglob('*'):
+            paths = ([source / name for name in Path(args[args.index('--files-from') + 1]).read_text().splitlines()]
+                     if '--files-from' in args else source.rglob('*'))
+            for path in paths:
                 if path.is_file():
                     target = destination / path.relative_to(source)
                     target.parent.mkdir(parents=True, exist_ok=True)
@@ -143,6 +149,9 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual([size for _, size in self.storage.uploads], [(self.output / 'metadata.json').stat().st_size])
         self.assertEqual(second['parent'], first['commit_id'])
         self.assertNotEqual(second['commit_id'], first['commit_id'])
+        root = remote_path(self.manifest['storage'], self.manifest['study_id'])
+        self.assertFalse(any(event[0] == 'lsjson' and event[1] in (root, root + '/blobs')
+                             for event in self.storage.events))
         self.assertEqual(second['attempt_id'], first['attempt_id'])
         self.assertTrue(any(event[0] == 'check' and '--download' in event for event in self.storage.events))
         self.assertEqual(self.manifest['last_recovery']['commit_id'], second['commit_id'])

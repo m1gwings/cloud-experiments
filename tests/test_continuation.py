@@ -91,6 +91,15 @@ class EnvironmentTests(unittest.TestCase):
             with self.assertRaises(Error):
                 environment.constraints(lock)
 
+    def test_legacy_duplicate_editable_project_is_not_fetched_from_index(self):
+        saved = env_lock()
+        saved['packages']['experiments-wo-stress'] = '0.1.0'
+        self.assertEqual(environment.constraints(saved), 'numpy==2.2.0\npip==25.0\n')
+        environment.verify(saved, env_lock())
+        saved['packages']['experiments-wo-stress'] = '9.9.9'
+        with self.assertRaisesRegex(Error, 'Conflicting'):
+            environment.constraints(saved)
+
     def test_new_archived_source_version_is_left_to_ews_compatibility(self):
         actual = env_lock()
         actual['local_projects']['experiments-wo-stress']['version'] = '0.2.0'
@@ -270,6 +279,9 @@ class StateRoundTripTests(unittest.TestCase):
     def call(self, *args, **kwargs):
         prefix = 'test:test-bucket'
         mapped = [str(self.remote)+a[len(prefix):] if isinstance(a, str) and a.startswith(prefix) else a for a in args]
+        if args[0] == 'lsjson' and not Path(mapped[1]).exists():
+            data = b'{"Path":"","IsDir":true}' if '--stat' in args else b'[]'
+            return subprocess.CompletedProcess(mapped, 0, data, b'')
         result = subprocess.run(['rclone', '--config', str(self.empty), *mapped], capture_output=True, timeout=20)
         if result.returncode:
             raise Error('local fake storage failed: '+result.stderr.decode())
@@ -573,7 +585,7 @@ class TimeoutTests(unittest.TestCase):
                 capture_output=True)
             self.assertEqual(result.returncode, 0, result.stderr.decode())
         self.assertIn(b'cloud-delete.service', files['/etc/systemd/system/cloud-reap.timer'])
-        self.assertIn(b'12min', files['/etc/systemd/system/cloud-finalize.service'])
+        self.assertIn(b'45min', files['/etc/systemd/system/cloud-finalize.service'])
 
 
 if __name__ == '__main__':

@@ -94,6 +94,12 @@ Each synchronization:
    referenced by neither the previous recovery point nor the candidate.
 5. Publishes and reads back the new cloud recovery commit last.
 
+History discovery lists only the flat commit and environment prefixes. Pruning
+checks each obsolete digest directly before deletion. Neither operation needs a
+recursive listing of the growing study object pool. Blob copy and verification
+have separate bounded transfer windows; the finalizer allows those windows to
+finish while the independent deadline reaper remains active.
+
 Pruning deliberately lags by one successful synchronization. This preserves the
 previous complete recovery point if deletion or publication is interrupted.
 Trajectory removals are accepted only through EWS's validated inventory, including
@@ -103,9 +109,10 @@ conservatively. Historical commit metadata survives, but arbitrary older output
 snapshots are not permanent archives. Download results you need to retain before
 later study evolution prunes them. The latest committed snapshot remains complete.
 
-Restore downloads precisely the selected inventory into an isolated directory,
-verifies all hashes and sizes, and invokes EWS's atomic restore into a new output
-tree. It never merges old remote tails into restored output. EWS then performs
+Restore downloads precisely the selected inventory in a bounded parallel batch
+into an isolated directory, verifies every hash and size, then invokes EWS's
+atomic restore into a new output tree. It never merges old remote tails into
+restored output. EWS then performs
 ordinary checkpoint verification/fallback, selection, invalidation and
 rematerialization. A damaged transfer fails before scientific execution.
 
@@ -135,6 +142,8 @@ establishes actual absence.
 The worker recreates the saved exact Python/runtime and index-package lock before
 restoring output. It installs archived experiment source and the exact EWS commit,
 then reapplies EWS after project dependencies and verifies the resulting lock.
+An archived editable project listed twice is rebuilt from its archived source,
+not fetched from the package index; conflicting duplicate versions are rejected.
 Unrecreatable local/direct dependencies, missing binary wheels or incompatible
 runtime/package changes fail setup. Use a compatible environment or `--fresh`.
 
