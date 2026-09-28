@@ -568,7 +568,7 @@ class TimeoutTests(unittest.TestCase):
         finally:
             case.doCleanups()
 
-    def test_bootstrap_contains_complete_importable_bundle_and_independent_reaper(self):
+    def test_bootstrap_contains_complete_importable_bundle_and_absolute_deadline(self):
         manifest = study_manifest(sample_config('/tmp'))
         data = bootstrap.render(manifest, {'HCLOUD_WORKER_TOKEN': 'fake-token'}, 'fake-rclone')
         self.assertLess(len(data.encode()), 32768)
@@ -584,8 +584,10 @@ class TimeoutTests(unittest.TestCase):
                 'import sys; sys.path.insert(0, sys.argv[1]); import cloud_experiments.worker', str(package)],
                 capture_output=True)
             self.assertEqual(result.returncode, 0, result.stderr.decode())
-        self.assertIn(b'cloud-delete.service', files['/etc/systemd/system/cloud-reap.timer'])
-        self.assertIn(b'45min', files['/etc/systemd/system/cloud-finalize.service'])
+        self.assertNotIn('/etc/systemd/system/cloud-reap.timer', files)
+        self.assertIn(b'TimeoutStartSec=0', files['/etc/systemd/system/cloud-finalize.service'])
+        self.assertIn(b'ExecStart=/usr/bin/python3 /opt/cloud-experiments/entry.py expire',
+                      files['/etc/systemd/system/cloud-deadline.service'])
 
 
 if __name__ == '__main__':

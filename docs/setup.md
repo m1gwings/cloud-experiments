@@ -308,10 +308,10 @@ cloud-run configs/pl_failure.yml --machine cpx32 --max-runtime 0.5 --name smoke
 
 **This is the first billable command.** Replace the config path with your small
 config if `pl_failure.yml` is a long study. The half-hour deadline includes OS and
-Python setup; interruption at that deadline should still save partial results.
-There is up to 15 minutes of bounded last-resort cleanup allowance, with further
-API retry time if Hetzner deletion is unavailable. The implementation agent must
-not run this command as an integration test.
+Python setup. At that deadline, active work stops and the VM requests deletion;
+only earlier committed recovery is guaranteed. API deletion retries if Hetzner
+is unavailable. The implementation agent must not run this command as an
+integration test.
 
 Observe the printed run ID, attach if desired, and verify:
 
@@ -336,7 +336,7 @@ dirty source snapshot after changing your laptop checkout. Each new run is billa
 ## 10. Normal operation
 
 Read [automatic continuation](continuation.md). Repeat the same `cloud-run CONFIG`
-with the full EWS pin after a timeout/cancellation to restore and continue its
+after a timeout/cancellation to restore and continue its
 persistent output. Machine/runtime may change. Use `--fresh` for a new lineage,
 then `--study STUDY_ID` to continue that specific lineage. Exact completed requests
 avoid compute. `cloud-results list --attempts STUDY_ID` shows history. The current

@@ -115,7 +115,7 @@ class ConfigTests(unittest.TestCase):
         self.assertIsNone(m["server_id"])
         self.assertEqual(m["status"], "provisioning")
 
-    def test_bootstrap_arms_independent_absolute_timers_before_setup(self):
+    def test_bootstrap_arms_absolute_deadline_before_setup(self):
         payload = bootstrap.render(sample_manifest(self.c), {"HCLOUD_WORKER_TOKEN": "FAKE-BOOT-TOKEN"}, "FAKE-RCLONE")
         self.assertLessEqual(len(payload.encode()), 32768)
         data = json.loads(payload.split("\n", 1)[1])
@@ -124,7 +124,8 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(files["/opt/cloud-experiments/rclone.conf"]["permissions"], "0600")
         self.assertNotIn("FAKE-BOOT-TOKEN", payload)
         self.assertNotIn("apt-get", json.dumps(data["runcmd"]))
-        self.assertIn("cloud-reap.timer", json.dumps(data["runcmd"]))
+        self.assertIn("cloud-deadline.timer", json.dumps(data["runcmd"]))
+        self.assertNotIn("cloud-reap.timer", json.dumps(data))
 
     def test_doctor_is_offline_and_never_opens_credentials(self):
         with patch("cloud_experiments.cli.shutil.which", return_value="/fake/tool"), patch("builtins.open", side_effect=AssertionError("unexpected read")), contextlib.redirect_stdout(io.StringIO()):

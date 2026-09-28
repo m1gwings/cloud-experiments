@@ -84,7 +84,7 @@ def launch(config, manifest, directory):
         storage.call("copyto", str(out / "manifest.json"), storage.path(rid) + "/manifest.json", timeout=45)
         ssh = ssh_for(config, server)
         ssh.wait()
-        print("✓ VM ready (both deadline timers armed)")
+        print("✓ VM ready (absolute deadline armed)")
         inputs = [out / "source/source.tar.gz", out / "source/index.json"]
         if manifest.get("reproduction_environment_sha256"):
             inputs.append(out / "machine/environment.json")

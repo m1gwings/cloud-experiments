@@ -6,6 +6,6 @@ OnFailure=cloud-delete.service
 [Service]
 Type=oneshot
 ExecStart=@ENTRY@ finalize
-TimeoutStartSec=45min
+TimeoutStartSec=0
 TimeoutStopSec=10
 UMask=0077

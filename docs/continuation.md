@@ -1,6 +1,6 @@
 # One persistent study, disposable execution attempts
 
-Repeat `cloud-run CONFIG --ews-ref FULL_COMMIT` to continue the same study after
+Repeat `cloud-run CONFIG` to continue the same study after
 an interruption, timeout, or cancellation. A replacement VM restores the newest
 committed compatible recovery snapshot. EWS decides which simulations, metrics,
 variants and checkpoints remain usable. Cloud tooling restores verified bytes;
@@ -54,8 +54,8 @@ The target recovery window is one interval plus the time needed to reach a safe
 protocol boundary, seal and transfer. A long indivisible step, large initial
 snapshot, slow disk/network, or outage can extend it. The displayed last durable
 recovery timestamp is the reliable boundary. Failed transfers retain the previous
-recovery point, compute continues, and a later interval retries. Cancellation,
-the absolute deadline, and the independent deletion timer still take precedence.
+recovery point, compute continues, and a later interval retries. Cancellation
+and the absolute deadline still take precedence.
 When EWS uses partitioned figures, their completed plots and compact group
 summaries enter the next committed snapshot, even if unrelated groups are still
 running. `cloud-results pull STUDY_ID --plots` sees only those committed plots;
@@ -101,8 +101,8 @@ Each synchronization:
 History discovery lists only the flat commit and environment prefixes. Pruning
 checks each obsolete digest directly before deletion. Neither operation needs a
 recursive listing of the growing study object pool. Blob copy and verification
-have separate bounded transfer windows; the finalizer allows those windows to
-finish while the independent deadline reaper remains active.
+have separate bounded transfer windows. The finalizer can finish those windows
+while the absolute deadline is still in the future.
 
 Pruning deliberately lags by one successful synchronization. This preserves the
 previous complete recovery point if deletion or publication is interrupted.
@@ -183,12 +183,14 @@ There is no second EWS output copy or duplicate remote output archive beyond the
 local sealed copy required by EWS v1.
 
 EWS completion is distinct from successful final archive publication. Failure
-records keep that distinction and the last durable recovery point. The finalizer
-still has a 12-minute service limit, OnFailure deletion, and an independent
-original-deadline-plus-15-minute reaper. The deletion service can publish a small
-failure/deletion record even if the finalizer was killed during a large transfer.
-No upload failure keeps compute alive indefinitely. Provider outages or revoked
-deletion credentials still require intervention; powered-off VMs remain billable.
+records keep that distinction and the last durable recovery point. Normal
+finalization has no service wall-clock limit. It requests deletion immediately
+after success or an unrecoverable error; an abnormal exit also triggers deletion.
+The absolute deadline stops an unfinished finalizer and requests deletion. A
+deletion retry cannot overtake an active finalizer before that deadline. The
+deletion service can publish a small failure/deletion record even when a large
+transfer was interrupted. Provider outages or revoked deletion credentials still
+require intervention; powered-off VMs remain billable.
 
 ## Browsing and reproduction
 

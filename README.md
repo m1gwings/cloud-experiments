@@ -372,17 +372,19 @@ provide generic native/GPU portability. Deletion of the public EWS repository/co
 
 ## Cleanup and security
 
-The first-boot cloud-init payload installs deadline and last-resort timers before
-package installation or source transfer. The deadline includes setup time. At the
-deadline the worker stops setup, requests graceful EWS interruption for up to
-90 seconds, then stops its cgroup (20 seconds before forced kill), performs a final
-incremental recovery sync and archive upload, publishes lifecycle state, and
-requests its own deletion. Upload failures are recorded when possible and **never
-prevent deletion**. Finalization is bounded; the separate reap timer starts API
-deletion at deadline + 15 minutes even if finalization is stuck. Deletion retries
-every 30 seconds on errors. Absolute persistent timers survive reboot; boot-time
-timers also cover first initialization after a deadline. `--keep-on-setup-failure`
-retains only setup failures, and never disables either timer.
+The first-boot cloud-init payload arms the absolute deadline before package
+installation or source transfer. The deadline includes setup time. Normal
+completion, failure, or cancellation stops EWS, attempts final recovery and
+archive publication, then requests immediate VM deletion. An active finalizer
+has no independent wall-clock limit; deletion waits for its publication unless
+the absolute deadline arrives. At that deadline the worker stops setup, EWS,
+and any unfinished finalizer, records the interrupted state when possible, and
+requests deletion. The preceding committed recovery remains usable if final
+publication was interrupted. Upload failures are recorded when possible and
+**never prevent deletion**. Deletion retries every 30 seconds on errors. The
+persistent deadline timer survives reboot; a boot-time trigger also covers first
+initialization after the deadline. `--keep-on-setup-failure` retains only setup
+failures until that deadline.
 
 Deletion checks the live server's ID, name, `managed-by=cloud-experiments`, and
 `run-id=RUN_ID`. Worker deletion also checks its link-local metadata ID. An

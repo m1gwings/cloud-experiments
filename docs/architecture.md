@@ -35,9 +35,9 @@ configuration belong in experiment repositories.
    secret is embedded in an argument or written to laptop state. hcloud JSON is
    consumed privately; raw output, including possible generated passwords, is
    never printed or persisted.
-3. First boot arms persistent absolute deadline/reap timers before apt or SSH
-   upload. Readiness requires both active timers. Boot-relative timers provide a
-   second trigger if first boot initialization passed a deadline.
+3. First boot arms the persistent absolute deadline timer before apt or SSH
+   upload. Readiness requires that timer. A boot-relative trigger covers first
+   initialization after the deadline.
 4. Laptop transfers source/index and starts `cloud-supervisor.service`. The root
    supervisor installs OS tools, verifies its provider lease, recreates the locked
    unprivileged environment, queries EWS compatibility and restores committed output.
@@ -56,7 +56,7 @@ configuration belong in experiment repositories.
    it never copies the parent environment or passes the URL in argv. The source
    credential is root-owned mode 600 outside `/work`, and the original provider
    credential paths remain inaccessible to the experiment service.
-6. Completion, failure, cancellation, or a deadline starts a separate root
+6. Completion, failure, or cancellation starts a separate root
    finalizer. It stops setup, asks EWS to checkpoint through SIGINT with 90 seconds
    grace, then stops the experiment cgroup. It runs the same recovery sync one
    final time, collects other workspace deltas, and publishes final archive state
@@ -66,9 +66,11 @@ configuration belong in experiment repositories.
    bounded and cannot prevent deletion. The deletion service independently
    publishes a small status even if the finalizer has been killed. A
    finally block starts `cloud-delete.service`; systemd `OnFailure` handles an
-   abnormal finalizer exit/timeout. Deletion failures restart after 30 seconds.
-8. At the original deadline + 15 minutes, the independently installed reap timer
-   starts that same delete service even if any other component is stuck.
+   abnormal finalizer exit. Deletion failures restart after 30 seconds.
+8. At the absolute deadline, the deadline service stops setup, experiment, and
+   any unfinished finalizer, then requests deletion. Its failure path also
+   requests deletion. Before that deadline, deletion retries defer to an active
+   finalizer until it finishes publishing.
 
 The direct API deletion path never trusts a requested server ID alone. It reads
 the VM's metadata identity and checks name, ID, and both labels against the live
@@ -77,7 +79,7 @@ known ID before deleting. Label drift intentionally causes refusal and requires
 manual investigation; safe targeting takes precedence over deleting an unknown VM.
 
 Root-owned reason/finalization locks serialize concurrent cancellation and
-completion. A timeout may supersede an in-flight reason, but never rewrites an
+completion. A deadline can interrupt an in-flight finalizer, but never rewrites an
 already finalized successful/failed run during deletion retries. Repeated
 finalization reuses its completion marker. A retained setup failure can still
 transition to timeout or cancellation at a later request.
@@ -95,7 +97,8 @@ transition to timeout or cancellation at a later request.
 | Experiment exits / tmux dies | Capture exit when available; finalize as completed/failed. |
 | Periodic sync failure | Retain preceding recovery; resume compute and retry later. |
 | Final upload/collection failure | Record `finalization_failed` independently; delete anyway. |
-| Finalizer hangs or crashes | Bounded service, OnFailure deletion, and independent reap timer. |
+| Finalizer hangs | Absolute deadline stops it and requests deletion; previous recovery remains usable. |
+| Finalizer crashes | OnFailure requests checked deletion. |
 | Worker API permission/availability failure | Retry deletion; user must restore access or intervene. |
 | Guest never boots/cloud-init fails/kernel freezes | No in-guest guarantee; inspect Console. |
 

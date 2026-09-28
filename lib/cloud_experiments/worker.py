@@ -446,9 +446,43 @@ class Worker:
                 if not keep:
                     self.systemctl("start", "--no-block", "cloud-delete.service")
 
+    def deadline_expired(self, manifest, now=None):
+        return (now or dt.datetime.now(dt.timezone.utc)) >= dt.datetime.fromisoformat(manifest["deadline_at"])
+
+    def expire(self):
+        """The absolute deadline stops all writers and requests checked deletion."""
+        try:
+            for service in ("cloud-finalize.service", "cloud-supervisor.service", "cloud-experiment.service"):
+                self.systemctl("stop", service, timeout=40, check=False)
+            m = self.manifest()
+            if m["status"] in ("provisioning", "running", "setup_failed"):
+                m.update(status="timeout", compute={"status": "timeout", "exit_code": None})
+            elif m["status"] == "finalizing":
+                m["status"] = "finalization_failed"
+                m["archive"] = {"status": "failed", "error": "Absolute deadline interrupted finalization."}
+                if m.get("sync", {}).get("status") == "syncing":
+                    m["sync"]["status"] = "failed"
+            self.publish_lifecycle(m)
+        finally:
+            self.systemctl("start", "--no-block", "cloud-delete.service")
+
     def delete(self):
-        """Best-effort status is independent of finalizer success or service timeout."""
+        """Deletion cannot overtake a live finalizer before the absolute deadline."""
         m = self.manifest()
+        reason_path = self.base / "reason.json"
+        done_path = self.base / "finalized.json"
+        finalized = (done_path.exists() and reason_path.exists()
+                     and read_json(done_path) == read_json(reason_path))
+        if not self.deadline_expired(m) and not finalized:
+            with (self.base / "finalize.lock").open("a") as lock:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    raise Error("Finalization is active; deletion will retry after it exits.") from None
+                else:
+                    fcntl.flock(lock, fcntl.LOCK_UN)
+            if self.systemctl("is-active", "cloud-finalize.service", check=False).returncode == 0:
+                raise Error("Finalization is active; deletion will retry after it exits.")
         if m.get("status") in ("running", "provisioning", "finalizing"):
             m["status"] = "interrupted" if m["status"] != "finalizing" else "finalization_failed"
         m["deletion"] = {"status": "requested", "requested_at": utcnow()}
@@ -520,6 +554,8 @@ def main():
         worker.finalize()
     elif action in ("cancelled", "timeout", "setup_failed"):
         worker.request(action)
+    elif action == "expire":
+        worker.expire()
     elif action == "delete":
         # systemd restarts this service on failure, even if the finalizer has died.
         worker.delete()
