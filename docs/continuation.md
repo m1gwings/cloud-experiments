@@ -56,6 +56,10 @@ snapshot, slow disk/network, or outage can extend it. The displayed last durable
 recovery timestamp is the reliable boundary. Failed transfers retain the previous
 recovery point, compute continues, and a later interval retries. Cancellation,
 the absolute deadline, and the independent deletion timer still take precedence.
+When EWS uses partitioned figures, their completed plots and compact group
+summaries enter the next committed snapshot, even if unrelated groups are still
+running. `cloud-results pull STUDY_ID --plots` sees only those committed plots;
+the live VM may have produced more since the last successful synchronization.
 
 ## Storage and publication
 
