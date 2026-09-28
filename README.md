@@ -176,6 +176,9 @@ Both channels can use the same Discord webhook. EWS notifications describe compu
 cloud messages separately identify last durable recovery, archive publication and
 VM deletion requests. A compute-completed message does not claim an archive or
 confirmed VM deletion.
+An EWS message that says a durable run checkpoint is available refers to state
+committed on that worker. It does not mean the cloud recovery snapshot has been
+uploaded. Use `cloud-status` to see the last durable remote recovery point.
 
 `run.ews_discord` defaults to `false`. With it enabled, a missing webhook fails
 before any input upload or VM creation. Launch validates presence and URL syntax;

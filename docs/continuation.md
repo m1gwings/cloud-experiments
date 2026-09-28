@@ -25,13 +25,13 @@ not invalidate that shortcut. EWS remains authoritative for changed requests.
 ## Versioned EWS boundary
 
 This implementation supports **`experiments-wo-stress/recovery`, version 1**,
-verified against EWS commit `e60b9bb62cffa59a87ec834d5c47c087b8ea2f86`.
+verified against EWS commit `057cc62ea162d6ac22af224b8cff8166da4a11d8`.
 The commit is provenance, not the protocol version: other pins are accepted only
 when they expose the explicitly supported contract. The laptop checks the fetched
 public declarations before creating compute; the worker queries the installed API
 again. Manifests, recovery commits and sync metadata retain the contract version.
 
-EWS owns the [recovery contract and snapshot API](https://github.com/m1gwings/experiments-wo-stress/blob/e60b9bb62cffa59a87ec834d5c47c087b8ea2f86/docs/CLOUD.md#versioned-recovery-snapshots).
+EWS owns the [recovery contract and snapshot API](https://github.com/m1gwings/experiments-wo-stress/blob/057cc62ea162d6ac22af224b8cff8166da4a11d8/docs/CLOUD.md#versioned-recovery-snapshots).
 Cloud code consumes its sealed inventory instead of interpreting checkpoint,
 trajectory or analysis directories. Unknown contracts fail closed. Older cloud
 state without this contract remains browsable, but cannot silently become a
@@ -119,6 +119,9 @@ atomic restore into a new output tree. It never merges old remote tails into
 restored output. EWS then performs
 ordinary checkpoint verification/fallback, selection, invalidation and
 rematerialization. A damaged transfer fails before scientific execution.
+EWS may report a committed run checkpoint before the next cloud recovery commit.
+Only a published cloud recovery commit is available after VM loss; the on-worker
+checkpoint message alone does not establish that remote durability.
 Large recoveries can contain many small blobs. Restore lists the blob pool once
 and filters it to the committed inventory, avoiding a lookup for each blob;
 small result selections use direct lookups. The download has a two-hour limit,
@@ -164,7 +167,7 @@ The override and optional `--timezone` are recorded in execution provenance and
 do not modify YAML or scientific/RNG identity. Portable execution rejects GPU
 and custom checkpoint backends through EWS's own validation.
 
-EWS's [portable CPU policy](https://github.com/m1gwings/experiments-wo-stress/blob/e60b9bb62cffa59a87ec834d5c47c087b8ea2f86/docs/PORTABILITY.md)
+EWS's [portable CPU policy](https://github.com/m1gwings/experiments-wo-stress/blob/057cc62ea162d6ac22af224b8cff8166da4a11d8/docs/PORTABILITY.md)
 retains scientific, dependency and architecture compatibility while excluding
 ephemeral host/kernel/core-count identity. This is not an OS image or a generic
 native-library reproducibility guarantee.

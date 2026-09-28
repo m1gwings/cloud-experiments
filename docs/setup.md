@@ -178,7 +178,7 @@ bucket = "migwings-experiments"
 
 [ews]
 repository = "https://github.com/m1gwings/experiments-wo-stress.git"
-default_ref = "e60b9bb62cffa59a87ec834d5c47c087b8ea2f86"
+default_ref = "057cc62ea162d6ac22af224b8cff8166da4a11d8"
 
 [run]
 sync_seconds = 300
