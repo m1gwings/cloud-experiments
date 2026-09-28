@@ -12,7 +12,7 @@ bucket = "migwings-experiments"
 
 [ews]
 repository = "https://github.com/m1gwings/experiments-wo-stress.git"
-default_ref = "d14d5c0fd334140ffd8f64e555a9f7112f274972" # inspected EWS recovery v1 producer
+default_ref = "e60b9bb62cffa59a87ec834d5c47c087b8ea2f86" # current tested EWS recovery v1 producer
 
 # Optional. Commands are argument arrays, never shell snippets.
 [run]
