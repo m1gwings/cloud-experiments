@@ -2,7 +2,7 @@
 Description=Cloud experiment setup and supervision
 After=network-online.target
 Wants=network-online.target
-OnFailure=cloud-finalize.service
+OnFailure=cloud-failure@supervisor.service
 
 [Service]
 Type=simple

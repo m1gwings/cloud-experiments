@@ -17,6 +17,10 @@ selection, checkpoint validation/fallback, and intentional trajectory pruning.
   source/config and cloud implementation provenance, credential isolation, and
   bounded finalization/deletion. Small failure metadata must not depend on a large
   artifact transfer. Report absent-server `running` state as `interrupted`.
+- Failure capsules belong to the cloud attempt namespace, outside EWS output.
+  Keep them failure-only, versioned, bounded, redacted and best-effort. Complete
+  diagnostic capture before cleanup when possible; a diagnostic timeout/failure
+  must still lead to checked deletion. Discord is an alert, not the log store.
 - Treat CPU worker allocation, synchronization interval, and timezone as
   operational controls. Use EWS's public resource/display validation; never edit
   study YAML or scientific identities to apply these controls.

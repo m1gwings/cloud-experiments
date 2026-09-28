@@ -1,7 +1,7 @@
 [Unit]
 Description=Preserve experiment results then destroy compute
 After=network-online.target
-OnFailure=cloud-delete.service
+OnFailure=cloud-failure@finalizer.service
 
 [Service]
 Type=oneshot

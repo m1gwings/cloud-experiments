@@ -15,7 +15,8 @@ def checkpoint_cycle(worker, manifest):
     snapshot = None
     try:
         snapshot = persistence.prepare(worker, manifest)
-    except Exception:
+    except Exception as exc:
+        worker.report_failure(manifest, component="supervisor", exc=exc)
         sync_failed(worker, manifest)
     # Sealed snapshot bytes are independent of the writer. Network I/O happens
     # only after resuming; no provider credentials enter the experiment process.
@@ -38,8 +39,12 @@ def transfer(worker, manifest, snapshot):
         manifest["sync"] = {"status": "committed", "attempted_at": utcnow(),
                             "contract": manifest["ews"]["cloud_contract"]}
         worker.publish_lifecycle(manifest)
-    except Exception:
+    except Exception as exc:
+        worker.report_failure(manifest, component="supervisor", exc=exc)
         sync_failed(worker, manifest)
+    finally:
+        if not (worker.base / "reason.json").exists():
+            worker.stage("compute", "compute.run")
 
 
 def monitor(worker, manifest):
@@ -52,6 +57,10 @@ def monitor(worker, manifest):
         if result_path.exists():
             code = read_json(result_path)["exit_code"]
             if not pausing or code != 130:
+                if code != 0 and not (worker.base / "reason.json").exists():
+                    worker.report_failure(dict(manifest, status="failed", compute={"status": "failed", "exit_code": code}),
+                                          component="compute", message=f"EWS exited with code {code}.", stage="compute.run",
+                                          unit="cloud-experiment.service")
                 worker.request("completed" if code == 0 else "failed", code)
                 return
             snapshot = checkpoint_cycle(worker, manifest)

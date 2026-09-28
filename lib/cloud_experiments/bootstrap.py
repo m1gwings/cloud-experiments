@@ -1,13 +1,13 @@
 """Generate first-boot files; credential-bearing cloud-init is streamed, not saved."""
 
 import base64
+import ast
 import datetime as dt
 import gzip
 import io
 import json
 import lzma
 from pathlib import Path
-import tokenize
 import zipfile
 
 from .common import Error
@@ -15,6 +15,21 @@ from .config import ews_discord_webhook
 
 ROOT = Path(__file__).resolve().parents[2]
 ENTRY = "/usr/bin/python3 /opt/cloud-experiments/entry.py"
+
+
+class _TransportCode(ast.NodeTransformer):
+    """Remove comments and docstrings only from the VM transport copy."""
+
+    def visit(self, node):
+        node = super().visit(node)
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            first = node.body[0] if node.body else None
+            if (isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant)
+                    and isinstance(first.value.value, str)):
+                node.body.pop(0)
+                if not node.body:
+                    node.body.append(ast.Pass())
+        return node
 
 
 def render(manifest, secrets, rclone_config):
@@ -27,18 +42,17 @@ def render(manifest, secrets, rclone_config):
         compressed = gzip.compress(content, mtime=0)
         if len(compressed) < len(content):
             content, encoding = compressed, "gz+b64"
-        files.append({"path": path, "permissions": mode, "owner": "root:root", "encoding": encoding,
-                      "content": base64.b64encode(content).decode()})
+        entry = {"path": path, "encoding": encoding, "content": base64.b64encode(content).decode()}
+        if mode != "0644":
+            entry.update(permissions=mode, owner="root:root")
+        files.append(entry)
 
     bundle = io.BytesIO()
     with zipfile.ZipFile(bundle, "w", zipfile.ZIP_STORED) as z:
-        for name in ("__init__.py", "common.py", "workspace.py", "worker.py", "studies.py", "environment.py", "persistence.py", "ews_contract.py", "synchronization.py"):
+        for name in ("__init__.py", "common.py", "workspace.py", "worker.py", "studies.py", "environment.py", "persistence.py", "ews_contract.py", "synchronization.py", "diagnostics.py"):
             source = (Path(__file__).parent / name).read_text()
-            # Comments remain in the repository; omitting them from the transport
-            # leaves headroom for real credentials within Hetzner's 32 KiB limit.
-            tokens = [token for token in tokenize.generate_tokens(io.StringIO(source).readline)
-                      if token.type != tokenize.COMMENT]
-            z.writestr("cloud_experiments/" + name, tokenize.untokenize(tokens))
+            # The repository retains explanatory text; the VM receives executable code.
+            z.writestr("cloud_experiments/" + name, ast.unparse(_TransportCode().visit(ast.parse(source))))
     add("/opt/cloud-experiments/code.zip.xz", lzma.compress(bundle.getvalue(), preset=9), "0644")
     add("/opt/cloud-experiments/entry.py", "import sys, os, lzma\nfrom pathlib import Path\np=Path('/opt/cloud-experiments/code.zip')\nif not p.exists():\n t=p.with_name('code-'+str(os.getpid())+'.tmp')\n t.write_bytes(lzma.decompress(p.with_suffix('.zip.xz').read_bytes()))\n t.chmod(0o644)\n os.replace(t,p)\nsys.path.insert(0,str(p))\nfrom cloud_experiments.worker import main\nmain()\n", "0644")
     add("/opt/cloud-experiments/manifest.json", json.dumps(manifest))

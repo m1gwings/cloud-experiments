@@ -20,6 +20,7 @@ shared package in `lib/cloud_experiments` has no third-party Python dependencies
 | `provenance.py` | Cloud implementation revision and content fingerprint. |
 | `persistence.py` | Shared content objects, verified recovery restore, pruning and commits. |
 | `synchronization.py` | Cooperative periodic pause, seal, resume and retry. |
+| `diagnostics.py` | Validated failure capsule schema, selected lifecycle fields and bounded redaction. |
 | `worker.py` | Installation, PTY execution, supervision, finalization, direct API deletion. |
 
 The default EWS argument array, explicit portable CPU/NumPy policy, inspect counts,
@@ -64,14 +65,28 @@ configuration belong in experiment repositories.
    independent wall-clock limit. Small lifecycle records precede large operations and
    carry failures independently of artifact transfer.
 7. Discord distinguishes compute, recovery, archive and deletion requests. It is
-   bounded and cannot prevent deletion. The deletion service independently
+   bounded and cannot prevent deletion. Failure alerts point to Object Storage
+   capsules instead of carrying logs. The deletion service independently
    publishes a small status even if the finalizer has been killed. A
-   finally block starts `cloud-delete.service`; systemd `OnFailure` handles an
-   abnormal finalizer exit. Deletion failures restart after 30 seconds.
+   finally block starts `cloud-delete.service`; an abnormal service exit routes
+   through the bounded `cloud-failure@.service` before the next cleanup unit.
+   If capture fails or times out, `OnFailure` starts deletion. Deletion failures
+   restart after 30 seconds.
 8. At the absolute deadline, the deadline service stops setup, experiment, and
    any unfinished finalizer, then requests deletion. Its failure path also
    requests deletion. Before that deadline, deletion retries defer to an active
    finalizer until it finishes publishing.
+
+Failures caught in Python and abnormal systemd exits use the same capsule writer.
+It selects a versioned set of lifecycle fields and records the current root-owned
+stage, safe error context and at most 200 recent journal lines (256 KiB maximum).
+The journal covers cloud worker units only and is redacted before transfer.
+Each capsule is append-only under `attempts/ATTEMPT_ID/diagnostics/EVENT_ID/`
+for a study attempt (or `runs/RUN_ID/diagnostics/EVENT_ID/` for a legacy run).
+`failure.json` is the final marker, published after journal verification. A failed
+partial upload is ignored by the reader. Normal success writes only the tiny
+local stage file and no remote diagnostic artifacts. Diagnostics never enter
+`artifacts/output`, alter a recovery commit, or delay cleanup without a bound.
 
 The direct API deletion path never trusts a requested server ID alone. It reads
 the VM's metadata identity and checks name, ID, and both labels against the live

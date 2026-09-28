@@ -170,6 +170,7 @@ def restore(worker, manifest):
 
 def prepare(worker, manifest, final=False):
     """Seal the stopped writer through EWS; its v1 API requires a local copy."""
+    worker.stage("finalizer" if final else "supervisor", "recovery.seal")
     if not (worker.base / "environment-ready.json").exists():
         return None
     output = worker.work / "output"
@@ -270,6 +271,7 @@ def sync(worker, manifest, snapshot=None, final=False):
     snapshot = prepare(worker, manifest, final=final) if owned else Path(snapshot)
     if snapshot is None:
         return None
+    component = "finalizer" if final else "supervisor"
     try:
         def call(*args, timeout=180):
             return worker.rclone(*args, timeout=None if final else timeout)
@@ -305,9 +307,12 @@ def sync(worker, manifest, snapshot=None, final=False):
                         raise Error("Sealed recovery payload changed before synchronization.")
                     os.link(source, target)
             if any(transfer.iterdir()):
+                worker.stage(component, "recovery.upload_blobs")
                 call("copy", str(transfer), root + "/blobs", "--ignore-times", timeout=1800)
+                worker.stage(component, "recovery.verify_blobs")
                 call("check", str(transfer), root + "/blobs", "--one-way", "--download", timeout=1800)
         # The EWS marker is published only after all of its payload is verified.
+        worker.stage(component, "recovery.publish_snapshot")
         marker = root + "/snapshots/" + recovery["snapshot_id"] + "/recovery.json"
         call("copyto", str(snapshot / "recovery.json"), marker, timeout=45)
         read_snapshot(call, root, commit)
@@ -321,6 +326,7 @@ def sync(worker, manifest, snapshot=None, final=False):
         worker.save(manifest)  # Persist the exact pending marker before its remote write.
         path = worker.base / "recovery-commit.json"
         write_json(path, commit)
+        worker.stage(component, "recovery.publish_commit")
         remote = root + "/commits/" + commit["commit_id"] + ".json"
         call("copyto", str(path), remote, timeout=45)
         if json.loads(call("cat", remote, timeout=30).stdout) != commit:

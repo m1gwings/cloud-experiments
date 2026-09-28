@@ -296,6 +296,10 @@ rclone lsd hetzner:
 
 These do not test writes or prove that worker deletion credentials work. Do not
 use commands that dump rclone/hcloud configuration when sharing diagnostics.
+For a failed attempt, run `cloud-diagnose ATTEMPT_ID` to read its compact
+Object Storage failure record, or add `--journal` for the bounded redacted
+service tail. `--list` and `--event EVENT_ID` inspect older failures. Discord
+only sends a short alert; successful attempts create no diagnostic capsules.
 
 ## 9. First real run and optional manual smoke test
 

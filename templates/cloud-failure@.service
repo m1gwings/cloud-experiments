@@ -1,0 +1,9 @@
+[Unit]
+Description=Capture abnormal cloud %i failure before cleanup
+OnFailure=cloud-delete.service
+
+[Service]
+Type=oneshot
+ExecStart=@ENTRY@ diagnose-failure %i
+TimeoutStartSec=90s
+UMask=0077

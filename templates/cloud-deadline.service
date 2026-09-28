@@ -1,6 +1,6 @@
 [Unit]
 Description=Stop and delete a cloud experiment at its absolute deadline
-OnFailure=cloud-delete.service
+OnFailure=cloud-failure@deadline.service
 
 [Service]
 Type=oneshot

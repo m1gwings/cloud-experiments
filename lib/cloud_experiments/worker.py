@@ -21,7 +21,7 @@ import urllib.request
 
 from .common import Error, command, read_json, redact, remote_path, require_managed, utcnow, write_json
 from .workspace import extract_snapshot, inventory
-from . import environment, persistence, ews_contract, synchronization
+from . import diagnostics, environment, persistence, ews_contract, synchronization
 
 BASE = Path("/opt/cloud-experiments")
 WORK = Path("/work")
@@ -89,6 +89,22 @@ def notify(manifest, secrets, api=http_json):
             print("Discord notification failed; cleanup continues.", flush=True)
 
 
+def notify_failure(record, persisted, secrets, api=http_json):
+    url = secrets.get("DISCORD_WEBHOOK_URL")
+    if not url:
+        return
+    try:
+        message = (f"❌ {record['run_id']} {record['status']}\n"
+                   f"component={record['component']} stage={record['stage']}\n"
+                   f"EWS={record['compute'].get('status', 'unknown')} "
+                   f"last recovery={record['last_recovery'].get('committed_at', 'none')}\n"
+                   f"diagnostics={'persisted' if persisted else 'unavailable'}\n"
+                   f"Run: cloud-diagnose {record['run_id']}")
+        api(url, method="POST", body={"content": message, "allowed_mentions": {"parse": []}})
+    except Exception:
+        print("Discord failure alert unavailable; cleanup continues.", flush=True)
+
+
 class Worker:
     def __init__(self, base=BASE, work=WORK, run=command):
         self.base, self.work, self.run = Path(base), Path(work), run
@@ -104,6 +120,116 @@ class Worker:
 
     def systemctl(self, *args, **kwargs):
         return self.run(["systemctl", *args], **kwargs)
+
+    def stage(self, component, name):
+        try:
+            write_json(self.base / "stage.json", {"component": component, "stage": name})
+        except OSError:
+            pass  # Diagnostics must not change the normal execution path.
+
+    def current_stage(self):
+        try:
+            return read_json(self.base / "stage.json")["stage"]
+        except (OSError, ValueError, KeyError, TypeError):
+            return "lifecycle.unknown"
+
+    def notify_lifecycle(self, manifest):
+        failed = (manifest.get("status") in {"failed", "setup_failed", "finalization_failed"}
+                  or manifest.get("compute", {}).get("status") in {"failed", "setup_failed"})
+        if failed and any((self.base / "diagnostics").glob("*/failure.json")):
+            return
+        notify(manifest, self.secrets())
+
+    def diagnostic_secrets(self):
+        values = [value for value in os.environ.values() if len(value) >= 4]
+        try:
+            values.extend(str(value) for value in self.secrets().values() if value)
+        except (OSError, ValueError, KeyError):
+            pass
+        try:
+            for line in (self.base / "rclone.conf").read_text().splitlines():
+                if "=" in line and not line.lstrip().startswith(("#", ";")):
+                    value = line.partition("=")[2].strip()
+                    if value:
+                        values.append(value)
+        except OSError:
+            pass
+        return values
+
+    def unit_state(self, unit):
+        if unit not in diagnostics.UNITS:
+            return {}
+        result = {"unit": unit}
+        try:
+            output = self.systemctl("show", "--property=Result", "--property=ExecMainStatus", unit,
+                                    timeout=5, check=False).stdout.decode(errors="replace")
+            values = dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
+            result.update(result=values.get("Result", "unknown"),
+                          exec_status=values.get("ExecMainStatus", "unknown"))
+        except Exception:
+            result.update(result="unavailable", exec_status="unavailable")
+        return result
+
+    def report_failure(self, manifest, *, component, exc=None, message=None, stage=None, unit=None,
+                       error_kind=None):
+        """Best-effort bounded capsule; neither its upload nor alert can block cleanup."""
+        persisted = False
+        record = None
+        try:
+            secrets = self.diagnostic_secrets()
+            detail = message or (str(exc) if isinstance(exc, Error) else "Unexpected worker failure; details withheld.")
+            systemd = ({"unit": unit, "result": "caught-exception", "exec_status": "n/a"}
+                       if unit and exc else self.unit_state(unit) if unit else {})
+            record = diagnostics.failure(manifest, component=component, stage=stage or self.current_stage(),
+                                         error_kind=error_kind or (type(exc).__name__ if exc else "SystemdFailure"),
+                                         message=detail, systemd=systemd,
+                                         exc=exc, secrets=secrets)
+            directory = self.base / "diagnostics" / diagnostics.event_id()
+            directory.mkdir(parents=True, mode=0o700)
+            try:
+                raw = self.run(["journalctl", "--no-pager", "--output=short-iso", "--lines=200",
+                                *[part for unit_name in diagnostics.UNITS for part in ("-u", unit_name)]],
+                               timeout=8, check=False).stdout
+            except Exception:
+                raw = b"Journal unavailable.\n"
+            context = "Failure: " + record["message"] + "\n" + "\n".join(record["traceback"]) + "\n"
+            journal_text = raw.decode(errors="replace") if isinstance(raw, bytes) else raw
+            journal = diagnostics.journal_tail(journal_text + "\n" + context, secrets)
+            with os.fdopen(os.open(directory / "journal.log", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as output:
+                output.write(journal)
+            write_json(directory / "failure.json", record)
+            remote = remote_path(manifest["storage"], manifest["run_id"]) + "/diagnostics/" + directory.name
+            self.rclone("copyto", str(directory / "journal.log"), remote + "/journal.log", timeout=10)
+            self.rclone("check", str(directory), remote, "--include", "journal.log",
+                        "--one-way", "--download", timeout=10)
+            self.rclone("copyto", str(directory / "failure.json"), remote + "/failure.json", timeout=10)
+            if self.rclone("cat", remote + "/failure.json", timeout=10).stdout != (directory / "failure.json").read_bytes():
+                raise Error("Failure diagnostic read-back did not match.")
+            persisted = True
+        except Exception:
+            print("Failure diagnostic upload unavailable; cleanup continues.", flush=True)
+        if record is not None:
+            try:
+                notify_failure(record, persisted, self.secrets())
+            except Exception:
+                pass
+        return persisted
+
+    def diagnose_service_failure(self, component):
+        units = {"supervisor": "cloud-supervisor.service", "finalizer": "cloud-finalize.service",
+                 "deadline": "cloud-deadline.service"}
+        unit = units[component]
+        manifest = self.manifest()
+        deadline_finalization = component == "deadline" and manifest.get("status") == "finalizing"
+        if component == "finalizer" or deadline_finalization:
+            manifest["status"] = "finalization_failed"
+        message = ("Absolute deadline service failed while stopping unfinished finalization."
+                   if deadline_finalization else f"{unit} exited abnormally before completing its lifecycle work.")
+        self.report_failure(manifest, component="finalizer" if deadline_finalization else component,
+                            unit=unit, message=message,
+                            error_kind="AbsoluteDeadline" if deadline_finalization else None)
+        next_unit = "cloud-finalize.service" if component == "supervisor" else "cloud-delete.service"
+        self.systemctl("start", "--no-block", next_unit)
 
     def save(self, manifest):
         with self.state_lock:
@@ -152,7 +278,7 @@ class Worker:
             # new parent. The request must never overwrite recovery bookkeeping.
             # reason.json is authoritative until the finalizer stops the writer.
             self.publish_lifecycle(current, persist=False)
-            notify(current, self.secrets())
+            self.notify_lifecycle(current)
         self.systemctl("start", "--no-block", "cloud-finalize.service")
 
     def rclone(self, *args, timeout=180):
@@ -162,7 +288,10 @@ class Worker:
     def upload(self, manifest, final=False):
         """Upload payload first, verify it, publish the authoritative manifest last."""
         remote = remote_path(manifest["storage"], manifest["run_id"])
+        self.stage("finalizer" if final else "supervisor", "archive.upload" if final else "setup.upload")
         self.rclone("copy", str(self.out), remote, "--exclude", "/manifest.json", timeout=None if final else 360)
+        if final:
+            self.stage("finalizer", "archive.verify")
         self.rclone("check", str(self.out), remote, "--exclude", "/manifest.json", "--one-way", timeout=None if final else 120)
         manifest["upload"] = {"status": "verified", "verified_at": utcnow()}
         self.save(manifest)
@@ -226,8 +355,10 @@ class Worker:
         self.out.mkdir(exist_ok=True)
         (self.out / "logs").mkdir(exist_ok=True)
         try:
+            self.stage("supervisor", "setup.identify_vm")
             m["server_id"] = own_server_id()
             self.save(m)
+            self.stage("supervisor", "setup.install_os")
             apt_env = dict(os.environ, DEBIAN_FRONTEND="noninteractive")
             for argv in (["apt-get", "update"], ["apt-get", "install", "-y", "git", "python3", "python3-venv", "python3-pip", "tmux", "rclone", "curl", "util-linux"]):
                 result = self.run(argv, env=apt_env, timeout=1200, check=False)
@@ -260,6 +391,7 @@ class Worker:
                 write_json(self.base / "expected-environment.json", expected_environment)
                 (self.work / "runtime/requirements-lock.txt").write_text(environment.constraints(expected_environment))
             self.run(["chown", "-R", "experiment:experiment", str(self.work)])
+            self.stage("supervisor", "setup.install_ews")
             ews = self.work / ".ews"
             self.user_step(["git", "init", str(ews)])
             self.user_step(["git", "-C", str(ews), "fetch", "--depth=1", m["ews"]["repository"], m["ews"]["commit"]])
@@ -291,6 +423,7 @@ class Worker:
                 ews_contract.query(self, m["ews"]["cloud_contract"])
                 runtime_options = ews_contract.runtime_options(self, m)
             if m.get("study_id"):
+                self.stage("supervisor", "setup.restore")
                 if runtime_options is None and m.get("portable_continuation", True):
                     # Legacy reproductions retain their original resource checks.
                     self.user_step(["python", "-c", "from experiments_wo_stress import load_config; from experiments_wo_stress.execution.portability import portable_environment; import sys; portable_environment(load_config(sys.argv[1]))", str(source / m["config"]["path"])])
@@ -319,12 +452,16 @@ class Worker:
             m["machine_info"] = self.machine_info()
             self.save(m)
             self.upload(m)
+            self.stage("compute", "compute.run")
             self.start_experiment()
             (self.base / "started").touch()
-            notify(m, self.secrets())
+            self.notify_lifecycle(m)
             synchronization.monitor(self, m)
         except Exception as exc:
-            m["setup_error"] = str(exc) if isinstance(exc, Error) else "Worker setup/execution failed (details withheld)."
+            m["setup_error"] = diagnostics.safe_text(str(exc), self.diagnostic_secrets()) if isinstance(exc, Error) else "Worker setup/execution failed (details withheld)."
+            diagnostic = dict(m, status="failed" if (self.base / "started").exists() else "setup_failed")
+            self.report_failure(diagnostic, component="supervisor", exc=exc,
+                                unit="cloud-supervisor.service")
             self.save(m)
             print("Worker setup/execution failed; finalizing (details withheld).", flush=True)
             with (self.out / "logs/worker.log").open("a") as log:
@@ -388,6 +525,7 @@ class Worker:
                     self.systemctl("start", "--no-block", "cloud-delete.service")
                 return
             try:
+                self.stage("finalizer", "finalization.stop_writer")
                 # Stop setup first, then request a safe EWS boundary before cgroup teardown.
                 supervisor = self.systemctl("stop", "cloud-supervisor.service", timeout=40, check=False)
                 if supervisor.returncode:
@@ -419,6 +557,7 @@ class Worker:
                     persistence.sync(self, m, final=True)
                     m["sync"] = {"status": "committed", "attempted_at": utcnow(), "contract": m["ews"]["cloud_contract"]}
                     self.publish_lifecycle(m)
+                self.stage("finalizer", "archive.collect")
                 self.collect(m)
                 # Output bytes already live in the recovery object pool. Only
                 # logs, inputs, provenance and other workspace deltas remain.
@@ -426,20 +565,21 @@ class Worker:
                 m.update(reason)
                 m["archive"] = {"status": "published", "published_at": utcnow()}
                 self.save(m)
+                self.stage("finalizer", "archive.publish")
                 remote = remote_path(m["storage"], m["run_id"]) + "/manifest.json"
                 self.rclone("copyto", str(self.out / "manifest.json"), remote, timeout=None)
                 self.publish_lifecycle(m)
-                notify(m, self.secrets())
+                self.notify_lifecycle(m)
                 write_json(done, reason)
-            except Exception:
+            except Exception as exc:
                 m["status"] = "finalization_failed"
                 m["compute"] = {"status": reason["status"], "exit_code": reason["exit_code"]}
                 m["archive"] = {"status": "failed"}
                 if m.get("sync", {}).get("status") == "syncing":
                     m["sync"]["status"] = "failed"
                 m["upload"] = {"status": "failed", "error": "Final synchronization or archive publication failed; preceding recovery is retained."}
+                self.report_failure(m, component="finalizer", exc=exc, unit="cloud-finalize.service")
                 self.publish_lifecycle(m)
-                notify(m, self.secrets())
                 print("Finalization failed; VM deletion will still be attempted.", flush=True)
                 write_json(done, reason)
             finally:
@@ -452,6 +592,7 @@ class Worker:
     def expire(self):
         """The absolute deadline stops all writers and requests checked deletion."""
         try:
+            interrupted_stage = self.current_stage()
             for service in ("cloud-finalize.service", "cloud-supervisor.service", "cloud-experiment.service"):
                 self.systemctl("stop", service, timeout=40, check=False)
             m = self.manifest()
@@ -462,7 +603,14 @@ class Worker:
                 m["archive"] = {"status": "failed", "error": "Absolute deadline interrupted finalization."}
                 if m.get("sync", {}).get("status") == "syncing":
                     m["sync"]["status"] = "failed"
+                self.report_failure(m, component="finalizer", stage=interrupted_stage,
+                                    message="Absolute deadline interrupted unfinished finalization.",
+                                    unit="cloud-finalize.service", error_kind="AbsoluteDeadline")
             self.publish_lifecycle(m)
+        except Exception as exc:
+            self.report_failure(self.manifest(), component="deadline", exc=exc,
+                                unit="cloud-deadline.service")
+            raise
         finally:
             self.systemctl("start", "--no-block", "cloud-delete.service")
 
@@ -487,8 +635,19 @@ class Worker:
             m["status"] = "interrupted" if m["status"] != "finalizing" else "finalization_failed"
         m["deletion"] = {"status": "requested", "requested_at": utcnow()}
         self.publish_lifecycle(m, persist=False)
-        notify(m, self.secrets())
-        delete_self(m, self.secrets())
+        self.notify_lifecycle(m)
+        self.stage("deletion", "deletion.request")
+        try:
+            delete_self(m, self.secrets())
+        except Exception as exc:
+            marker = self.base / "deletion-diagnostic.json"
+            if not marker.exists():
+                self.report_failure(m, component="deletion", exc=exc, unit="cloud-delete.service")
+                try:
+                    write_json(marker, {"reported_at": utcnow()})
+                except OSError:
+                    pass
+            raise
 
 
 def execute(work=WORK):
@@ -556,6 +715,8 @@ def main():
         worker.request(action)
     elif action == "expire":
         worker.expire()
+    elif action == "diagnose-failure":
+        worker.diagnose_service_failure(sys.argv[2])
     elif action == "delete":
         # systemd restarts this service on failure, even if the finalizer has died.
         worker.delete()

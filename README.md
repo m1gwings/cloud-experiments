@@ -24,6 +24,7 @@ cloud-results list
 cloud-results ls RUN_ID             # inspect remote files and sizes
 cloud-results pull RUN_ID --plots   # fetch just figures for inspection
 cloud-results pull RUN_ID           # retain a complete reproducibility bundle
+cloud-diagnose RUN_ID                # inspect the latest failure, if any
 ```
 
 Start with [the complete setup guide](docs/setup.md). The supplied
@@ -38,6 +39,7 @@ project, `nbg1`, and `migwings-experiments` bucket described there.
 | `cloud-results list --attempts STUDY_ID` | Inspect all attempts of a logical study. |
 | `cloud-attach RUN_ID` | Attach to the active experiment's tmux terminal. |
 | `cloud-status [RUN_ID]` | Show compute, recovery, archive and VM state after loading the stored run list; absent active workers are `interrupted`. |
+| `cloud-diagnose RUN_ID [--journal]` | Read the latest failure capsule; `--list` shows event IDs and `--event ID` selects an older event. |
 | `cloud-results list` | Show stored studies with current VM presence and separate persistence outcomes. |
 | `cloud-results ls RUN_ID [--json]` | Recursively list remote file paths and sizes without downloading contents. |
 | `cloud-results pull RUN_ID [--dest PATH]` | Download study inputs/history/current output, an attempt, or a legacy run, by default to `~/cloud-results/RUN_ID`. |
@@ -97,6 +99,12 @@ successful full pull; selective pulls never create or refresh it. Explicit
 `ls` output includes validated file names and sizes; progress displays do not.
 Cancelling a run reports that finalization was **requested**, not that uploads
 or VM deletion have already finished; check `cloud-status` afterwards.
+
+Failures create compact diagnostic capsules in Object Storage under the attempt.
+`cloud-diagnose RUN_ID` shows the stage, error, last recovery and service state;
+`--journal` adds the stored bounded journal tail. Successful runs create no
+capsules. Discord sends a short failure alert with the command to inspect the
+durable record; it is not a log store.
 
 ## What runs
 
@@ -382,6 +390,10 @@ and any unfinished finalizer, records the interrupted state when possible, and
 requests deletion. The preceding committed recovery remains usable if final
 publication was interrupted. Upload failures are recorded when possible and
 **never prevent deletion**. Deletion retries every 30 seconds on errors. The
+persistence of a failure capsule is best effort and precedes cleanup; a bounded
+diagnostic failure falls through to deletion. Capsules are outside EWS recovery
+state and cannot change a committed recovery point. Diagnostic fields are
+selected explicitly, and journal text is bounded and redacted before upload. The
 persistent deadline timer survives reboot; a boot-time trigger also covers first
 initialization after the deadline. `--keep-on-setup-failure` retains only setup
 failures until that deadline.

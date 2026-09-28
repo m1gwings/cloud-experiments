@@ -11,6 +11,7 @@ import time
 from .common import Error, command, managed_server, remote_path, require_managed, utcnow, valid_result_path, valid_run, write_json
 from .progress import Activity, activity
 from .studies import STUDY_RE, attempt_study, state_head
+from . import diagnostics
 
 
 class Hetzner:
@@ -121,6 +122,45 @@ class Storage:
 
     def path(self, rid=None):
         return remote_path(self.storage, rid)
+
+    def diagnostic_events(self, rid):
+        root = self.path(valid_run(rid))
+        top = json.loads(self.call("lsjson", root, "--dirs-only", "--max-depth", "1", timeout=30).stdout)
+        if not isinstance(top, list):
+            raise Error("Invalid diagnostic listing.")
+        if not any(isinstance(entry, dict) and entry.get("Name") == "diagnostics" for entry in top):
+            return []
+        entries = json.loads(self.call("lsjson", root + "/diagnostics", "--recursive", "--files-only", timeout=30).stdout)
+        if not isinstance(entries, list):
+            raise Error("Invalid diagnostic listing.")
+        return sorted(entry["Path"].split("/")[0] for entry in entries if isinstance(entry, dict)
+                      and isinstance(entry.get("Path"), str) and entry["Path"].endswith("/failure.json")
+                      and len(entry["Path"].split("/")) == 2
+                      and diagnostics.EVENT.fullmatch(entry["Path"].split("/")[0]))
+
+    def diagnostic(self, rid, event=None, *, include_journal=False):
+        rid = valid_run(rid)
+        events = self.diagnostic_events(rid)
+        if not events:
+            return None
+        event = event or events[-1]
+        if event not in events:
+            raise Error("Diagnostic event not found for this run.")
+        root = self.path(rid) + "/diagnostics/" + event
+        raw = self.call("cat", root + "/failure.json", "--head", "16385", timeout=30).stdout
+        if len(raw) > 16384:
+            raise Error("Failure diagnostic exceeds its size limit.")
+        record = diagnostics.validate(json.loads(raw))
+        if record["run_id"] != rid:
+            raise Error("Failure diagnostic run identity mismatch.")
+        journal = None
+        if include_journal:
+            journal = self.call("cat", root + "/journal.log", "--head",
+                                str(diagnostics.MAX_JOURNAL_BYTES + 1), timeout=30).stdout
+            if len(journal) > diagnostics.MAX_JOURNAL_BYTES:
+                raise Error("Failure diagnostic journal exceeds its size limit.")
+        return {"event": event, "count": len(events), "failure": record,
+                "journal": journal.decode(errors="replace") if isinstance(journal, bytes) else journal}
 
     def manifest(self, rid, *, recovery=True):
         if STUDY_RE.fullmatch(rid):

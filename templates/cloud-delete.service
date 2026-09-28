@@ -9,5 +9,5 @@ Type=oneshot
 ExecStart=@ENTRY@ delete
 Restart=on-failure
 RestartSec=30s
-TimeoutStartSec=90s
+TimeoutStartSec=180s
 UMask=0077

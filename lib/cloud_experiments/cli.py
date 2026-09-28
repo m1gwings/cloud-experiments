@@ -342,6 +342,45 @@ def status(args, config):
         print_row(manifest, matching_server(manifest, servers), provider_known=servers is not None)
 
 
+def diagnose(args, config):
+    storage = Storage(config)
+    if args.list:
+        events = storage.diagnostic_events(args.run_id)
+        if events:
+            print("\n".join(events))
+        else:
+            print(f"No failure diagnostics stored for {args.run_id}.")
+        return
+    capsule = storage.diagnostic(args.run_id, args.event, include_journal=args.journal)
+    if capsule is None:
+        print(f"No failure diagnostics stored for {args.run_id}.")
+        return
+    record = capsule["failure"]
+    def value(section, field, default="unknown"):
+        return str(record[section].get(field, default))
+
+    print(f"Run        {record['run_id']}")
+    print(f"Failure    {record['status']}")
+    print(f"Time       {record['occurred_at']}")
+    print(f"Component  {record['component']}")
+    print(f"Stage      {record['stage']}")
+    print(f"EWS        {value('compute', 'status')} (exit {value('compute', 'exit_code')})")
+    print(f"Recovery   {value('last_recovery', 'committed_at', 'none')}")
+    print(f"Archive    {value('archive', 'status')}")
+    print(f"Deletion   {value('deletion', 'status')}")
+    print(f"Event      {capsule['event']} ({capsule['count']} stored)")
+    if record["systemd"]:
+        print(f"Systemd    {value('systemd', 'unit')} | {value('systemd', 'result')} | exit {value('systemd', 'exec_status')}")
+    print(f"Message    {record['message']}")
+    for frame in record["traceback"]:
+        print(f"  {frame}")
+    if args.journal:
+        print("\nStored journal (bounded, redacted):")
+        print(capsule["journal"], end="" if capsule["journal"].endswith("\n") else "\n")
+    else:
+        print("Use --journal for the stored journal tail; --list and --event for older failures.")
+
+
 def cancel(args, config):
     rid = valid_run(args.run_id)
     cloud = Hetzner(config["hetzner"])
@@ -491,6 +530,12 @@ def parser(name):
             p.add_argument("--name")
     elif name == "cloud-status":
         p.add_argument("run_id", nargs="?")
+    elif name == "cloud-diagnose":
+        p.description = "Read the latest failure diagnostic capsule for an attempt from Object Storage."
+        p.add_argument("run_id", help="Attempt or legacy run ID")
+        p.add_argument("--journal", action="store_true", help="Display the complete stored bounded journal tail")
+        p.add_argument("--list", action="store_true", help="List stored diagnostic event IDs")
+        p.add_argument("--event", help="Select an older diagnostic event ID")
     elif name == "cloud-results":
         p.description = "Browse persistent studies, individual attempts, and legacy runs; download full archives or semantic EWS artifacts."
         p.epilog = ("Examples: cloud-results ls RUN_ID; cloud-results pull RUN_ID --plots; "
@@ -526,7 +571,8 @@ def main(name=None):
     try:
         config = load(args.config)
         actions = {"cloud-run": run_command, "cloud-attach": attach, "cloud-status": status,
-                   "cloud-results": results, "cloud-cancel": cancel, "cloud-reproduce": reproduce}
+                   "cloud-results": results, "cloud-cancel": cancel, "cloud-reproduce": reproduce,
+                   "cloud-diagnose": diagnose}
         if name == "cloud-doctor":
             doctor(config)
             return 0

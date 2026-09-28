@@ -168,6 +168,7 @@ class RecoveryTests(unittest.TestCase):
         self.storage.fail = lambda args: args[0] == 'check'
         with self.assertRaisesRegex(Error, 'interruption'):
             self.sync()
+        self.assertEqual(self.worker.current_stage(), 'recovery.verify_blobs')
         self.storage.fail = None
         head, _ = persistence.read_head(self.worker, self.manifest)
         self.assertEqual(head, first)

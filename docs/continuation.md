@@ -193,6 +193,16 @@ deletion service can publish a small failure/deletion record even when a large
 transfer was interrupted. Provider outages or revoked deletion credentials still
 require intervention; powered-off VMs remain billable.
 
+An abnormal finalizer exit, a caught synchronization error, or an absolute
+deadline that interrupts finalization produces a failure capsule under that
+attempt. Its stage and last committed recovery are diagnostic observations, not
+new recovery state. The previous verified commit remains authoritative until a
+new recovery marker and commit are published. Systemd captures process failures
+before requesting deletion; capture has a short timeout and deletion remains
+idempotent. `cloud-diagnose ATTEMPT_ID` reads the latest complete capsule;
+`--journal` shows its bounded redacted journal. A missing capsule does not make
+a legacy attempt unusable.
+
 ## Browsing and reproduction
 
 Use `cloud-results list`, `cloud-status STUDY_ID`, then `cloud-results pull
