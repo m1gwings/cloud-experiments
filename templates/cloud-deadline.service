@@ -1,8 +1,11 @@
 [Unit]
 Description=Stop and delete a cloud experiment at its absolute deadline
 OnFailure=cloud-failure@deadline.service
+StartLimitIntervalSec=0
 
 [Service]
 Type=oneshot
-ExecStart=@ENTRY@ expire
-TimeoutStartSec=90s
+ExecStart=/usr/bin/python3 /opt/cloud-experiments/failsafe.py
+TimeoutStartSec=240s
+Restart=on-failure
+RestartSec=30s

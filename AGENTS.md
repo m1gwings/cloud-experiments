@@ -21,6 +21,10 @@ selection, checkpoint validation/fallback, and intentional trajectory pruning.
   source/config and cloud implementation provenance, credential isolation, and
   bounded finalization/deletion. Small failure metadata must not depend on a large
   artifact transfer. Report absent-server `running` state as `interrupted`.
+- Keep cloud-init limited to the standalone checked self-deletion failsafe, its
+  immutable identity/token and absolute deadline units. Upload and verify the full
+  runtime after the timer is armed. Never disarm the timer during handoff; ordinary
+  worker growth must not increase user-data size.
 - Failure capsules belong to the cloud attempt namespace, outside EWS output.
   Keep them failure-only, versioned, bounded, redacted and best-effort. Complete
   diagnostic capture before cleanup when possible; a diagnostic timeout/failure

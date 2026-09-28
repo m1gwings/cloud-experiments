@@ -7,12 +7,13 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import tarfile
 import tempfile
 import unittest
 from unittest.mock import patch
 
 from test_core import decode_cloud_file, sample_config, sample_manifest
-from cloud_experiments import bootstrap, cli, config, source, worker
+from cloud_experiments import bootstrap, cli, config, runtime, source, worker
 from cloud_experiments.common import Error, read_json, write_json
 
 WEBHOOK = "https://discord.com/api/webhooks/123456789/fake-test-token"
@@ -28,10 +29,18 @@ class DiscordTests(unittest.TestCase):
     def rendered(self, enabled):
         self.config["run"]["ews_discord"] = enabled
         manifest = sample_manifest(self.config)
-        payload = bootstrap.render(manifest, {"HCLOUD_WORKER_TOKEN": "fake-cloud-token",
-                                             "DISCORD_WEBHOOK_URL": WEBHOOK}, "fake-s3-secret")
-        data = json.loads(payload.split("\n", 1)[1])
-        files = {entry["path"]: entry for entry in data["write_files"]}
+        secrets = {"HCLOUD_WORKER_TOKEN": "fake-cloud-token", "DISCORD_WEBHOOK_URL": WEBHOOK}
+        payload = bootstrap.render(manifest, secrets["HCLOUD_WORKER_TOKEN"])
+        archive = self.root / "runtime.tar.gz"
+        runtime.build(archive, manifest, secrets, "fake-s3-secret")
+        files = {}
+        with tarfile.open(archive, "r:gz") as bundle:
+            for member in bundle:
+                path = ("/opt/cloud-experiments/" if member.name.startswith("root/")
+                        else "/etc/systemd/system/") + member.name.split("/", 1)[1]
+                files[path] = {"path": path, "permissions": format(member.mode, "04o"),
+                               "owner": "root:root", "encoding": "b64",
+                               "content": __import__("base64").b64encode(bundle.extractfile(member).read()).decode()}
         return manifest, payload, files
 
     def test_setting_is_opt_in_and_strictly_boolean(self):
@@ -57,8 +66,10 @@ class DiscordTests(unittest.TestCase):
         self.assertNotIn("fake-cloud-token", unit)
         self.assertNotIn("fake-s3-secret", unit)
         self.assertNotIn(WEBHOOK, json.dumps(manifest))
+        self.assertNotIn(WEBHOOK, payload)
+        self.assertNotIn("fake-s3-secret", payload)
         self.assertNotIn(WEBHOOK, json.dumps(json.loads(payload.split("\n", 1)[1])["runcmd"]))
-        self.assertLessEqual(len(payload.encode()), 32768)
+        self.assertLessEqual(len(payload.encode()), 24 * 1024)
         self.assertTrue(source.excluded("home/ews-discord-webhook"))
 
     def test_disabled_forwarding_retains_root_lifecycle_webhook_only(self):
@@ -98,9 +109,10 @@ class DiscordTests(unittest.TestCase):
         reproduced = cli.reproduce_manifest(self.config, original, "reproduction")
         self.assertTrue(reproduced["settings"]["ews_discord"])
         replacement = WEBHOOK + "-rotated"
-        payload = bootstrap.render(reproduced, {"HCLOUD_WORKER_TOKEN": "fake", "DISCORD_WEBHOOK_URL": replacement}, "fake")
-        credential = next(entry for entry in json.loads(payload.split("\n", 1)[1])["write_files"] if entry["path"].endswith("/ews-discord-webhook"))
-        self.assertEqual(decode_cloud_file(credential).decode(), replacement)
+        archive = self.root / "replacement.tar.gz"
+        runtime.build(archive, reproduced, {"HCLOUD_WORKER_TOKEN": "fake", "DISCORD_WEBHOOK_URL": replacement}, "fake")
+        with tarfile.open(archive, "r:gz") as bundle:
+            self.assertEqual(bundle.extractfile("root/ews-discord-webhook").read().decode(), replacement)
         self.assertNotIn(replacement, json.dumps(reproduced))
         del original["settings"]["ews_discord"]  # old manifests keep the original no-forwarding behavior
         self.assertFalse(cli.reproduce_manifest(self.config, original, "legacy")["settings"]["ews_discord"])

@@ -447,11 +447,15 @@ must remain valid until all workers have been deleted.
 
 ## 12. Security and a replacement laptop
 
-The laptop retains permanent hcloud and SSH credentials. Only the dedicated
-worker token, selected S3 remote credentials, and optional Discord webhook reach
-the VM, through root-only cloud-init files. Cloud-init credentials pass through
-Hetzner's API/user-data storage, not just SSH; project administrators remain
-trusted. They disappear with the VM. Run/config manifests never contain them.
+The laptop retains permanent hcloud and SSH credentials. Cloud-init carries only
+the dedicated worker deletion token and a small checked deadline failsafe. After
+SSH confirms the timer is armed, the laptop sends a checksum-verified full runtime
+archive containing the selected S3 credentials and optional Discord webhook.
+Cloud-init's token passes through Hetzner's API/user-data storage; project
+administrators remain trusted. All worker credentials disappear with the VM.
+Run/config manifests never contain them. The deadline remains armed during
+runtime installation, and the minimal failsafe still deletes the VM if the laptop
+disappears before the upload.
 The unprivileged experiment cannot read Hetzner/S3 root credentials. An explicitly
 enabled `run.ews_discord` shares only the webhook through a protected systemd
 credential outside the captured workspace, then EWS's environment variable.

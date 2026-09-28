@@ -13,7 +13,8 @@ shared package in `lib/cloud_experiments` has no third-party Python dependencies
 | `workspace.py` | Safe extraction, secret/path exclusions and workspace inventories. |
 | `artifacts.py` | Discover and validate EWS semantic catalogs; resolve role paths without internal layout mappings. |
 | `providers.py` | Structured hcloud/rclone arguments; quoted SSH; remote manifests. |
-| `bootstrap.py` | Compressed Python bundle and systemd units in cloud-init JSON/YAML. |
+| `bootstrap.py`, `failsafe.py` | Fixed-size cloud-init deadline timer and standalone checked self-deletion. |
+| `runtime.py` | Post-SSH worker archive, checksum and activation. |
 | `studies.py` | Stable logical IDs, exact-request fingerprints and parent-linked state validation. |
 | `environment.py` | Safe exact environment capture, requirements and validation. |
 | `ews_contract.py` | Explicit supported EWS recovery envelope and public API adapter. |
@@ -33,18 +34,28 @@ configuration belong in experiment repositories.
 
 1. Laptop validates Git, builds the tarball/index/config, resolves EWS, and uploads
    checked immutable inputs plus a provisioning manifest before creating compute.
-2. `hcloud server create` receives the root-only cloud-init files via stdin. No
+2. `hcloud server create` receives only the small root-only failsafe files via stdin. No
    secret is embedded in an argument or written to laptop state. hcloud JSON is
    consumed privately; raw output, including possible generated passwords, is
    never printed or persisted.
 3. First boot arms the persistent absolute deadline timer before apt or SSH
    upload. Readiness requires that timer. A boot-relative trigger covers first
-   initialization after the deadline.
-4. Laptop transfers source/index and starts `cloud-supervisor.service`. The root
+   initialization after the deadline. The deadline service remains installed and
+   active throughout provisioning. If the laptop disappears before runtime upload,
+   its standalone handler verifies metadata identity and live Hetzner labels/name
+   before deleting this VM; failed requests retry.
+4. Once SSH confirms the armed marker, the laptop sends one private full-runtime
+   archive with worker code, units and runtime-only credentials. The VM verifies
+   its SHA-256 before installing files, reloads systemd without stopping the
+   deadline timer, and atomically marks the runtime ready last. The stable deadline
+   handler then runs normal worker expiry, with checked deletion as a fallback if
+   that path fails. Corrupt or incomplete archives cannot start the supervisor.
+   Laptop-side failure before activation requests checked provider deletion.
+5. Laptop transfers source/index and starts `cloud-supervisor.service`. The root
    supervisor installs OS tools, verifies its provider lease, recreates the locked
    unprivileged environment, queries EWS compatibility and restores committed output.
    Source, EWS checkout, runtime and package checks precede execution.
-5. A dedicated systemd cgroup runs the experiment's tmux server as `experiment`.
+6. A dedicated systemd cgroup runs the experiment's tmux server as `experiment`.
    `script` gives the command a PTY and captures stdout/stderr together. A file
    records the command exit code; the root supervisor watches it and the service.
    Losing tmux is detected as a failure even if the exit record is absent.
@@ -58,14 +69,14 @@ configuration belong in experiment repositories.
    it never copies the parent environment or passes the URL in argv. The source
    credential is root-owned mode 600 outside `/work`, and the original provider
    credential paths remain inaccessible to the experiment service.
-6. Completion, failure, or cancellation starts a separate root
+7. Completion, failure, or cancellation starts a separate root
    finalizer. It stops setup, asks EWS to checkpoint through SIGINT with 90 seconds
    grace, then stops the experiment cgroup. It runs the same recovery sync one
    final time, collects other workspace deltas, and publishes final archive state
    only after verification. Final snapshot and transfer subprocesses have no
    independent wall-clock limit. Small lifecycle records precede large operations and
    carry failures independently of artifact transfer.
-7. Discord distinguishes compute, recovery, archive and deletion requests. It is
+8. Discord distinguishes compute, recovery, archive and deletion requests. It is
    bounded and cannot prevent deletion. Failure alerts point to Object Storage
    capsules instead of carrying logs. The deletion service independently
    publishes a small status even if the finalizer has been killed. A
@@ -73,7 +84,7 @@ configuration belong in experiment repositories.
    through the bounded `cloud-failure@.service` before the next cleanup unit.
    If capture fails or times out, `OnFailure` starts deletion. Deletion failures
    restart after 30 seconds.
-8. At the absolute deadline, the deadline service stops setup, experiment, and
+9. At the absolute deadline, the deadline service stops setup, experiment, and
    any unfinished finalizer, then requests deletion. Its failure path also
    requests deletion. Before that deadline, deletion retries defer to an active
    finalizer until it finishes publishing.
@@ -108,8 +119,9 @@ transition to timeout or cancellation at a later request.
 | Bad input / dirty tree / failed EWS fetch / failed preflight upload | No VM created. |
 | Forwarding enabled but webhook missing | Reject before storage mutation or VM creation, including reproductions. |
 | Creation response lost | Discover only exact matching managed labels/name; request cleanup. |
-| SSH/upload/setup failure | Worker finalization, or checked laptop deletion if unreachable. |
-| Laptop dies before/during setup | First-boot timers remain responsible for eventual deletion. |
+| SSH/runtime upload failure | Checked laptop deletion; armed minimal deadline retries independently if needed. |
+| Source upload/setup failure after runtime activation | Worker finalization, or checked laptop deletion if unreachable. |
+| Laptop dies before/during setup | The armed failsafe or full worker owns eventual deletion. |
 | pip/apt hangs | Supervisor cgroup stopped at deadline; forced kill after 20 seconds. |
 | Experiment exits / tmux dies | Capture exit when available; finalize as completed/failed. |
 | Periodic sync failure | Retain preceding recovery; resume compute and retry later. |
@@ -245,7 +257,10 @@ available without reinterpreting old recovery state.
 The detailed recovery transaction, delayed pruning and failure invariants live
 in [continuation.md](continuation.md#storage-and-publication).
 
-The bootstrap bundle includes only worker dependencies. Textual cloud-init files
-use its supported [gzip/base64 encoding](https://docs.cloud-init.io/en/25.3/reference/yaml_examples/write_files.html)
-when smaller, preserving the 32 KiB provider limit without shortening cleanup
-protection. Tests decode the exact payload and validate every systemd unit.
+Cloud-init contains a fixed standalone deletion script, immutable attempt/study
+identity, the dedicated worker deletion token and two deadline units. Its size
+does not scale with ordinary worker features. Runtime code, Object Storage
+credentials, and both optional Discord uses arrive only after SSH readiness.
+Textual cloud-init files use supported [gzip/base64 encoding](https://docs.cloud-init.io/en/25.3/reference/yaml_examples/write_files.html)
+when smaller. A 24 KiB preflight budget leaves at least 8 KiB beneath Hetzner's
+32 KiB limit. Tests decode the payload, exercise the installer and verify all units.

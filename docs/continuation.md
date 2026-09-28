@@ -150,6 +150,13 @@ unique-name creation acquires the lease. **One Hetzner project must own each
 bucket's study namespace.** Do not share it across independent projects or rename
 or relabel workers. A losing concurrent launch never deletes the winner.
 
+Before uploading source or restoring any prior recovery, the VM arms a small
+absolute-deadline failsafe. The laptop then uploads a checksum-verified full
+runtime and marks it ready only after installation. The same deadline service
+uses normal worker expiry after activation, including failure diagnostics; if
+installation never finishes, it performs standalone checked deletion. This
+handoff does not alter the committed recovery selected for continuation.
+
 The worker checks its metadata identity and live provider labels before restore,
 environment publication, recovery publication and pruning. Parent-linked commits
 expose delayed conflicting publications. A deleted VM releases its lease; a

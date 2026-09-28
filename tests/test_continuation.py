@@ -10,6 +10,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import unittest
@@ -576,34 +577,33 @@ class TimeoutTests(unittest.TestCase):
         finally:
             case.doCleanups()
 
-    def test_bootstrap_contains_complete_importable_bundle_and_absolute_deadline(self):
+    def test_runtime_contains_complete_importable_bundle_and_absolute_deadline(self):
+        from cloud_experiments import runtime
         manifest = study_manifest(sample_config('/tmp'))
-        data = bootstrap.render(manifest, {'HCLOUD_WORKER_TOKEN': 'fake-token'}, 'fake-rclone')
-        self.assertLess(len(data.encode()), 32768)
+        data = bootstrap.render(manifest, 'fake-token')
+        self.assertLess(len(data.encode()), 24 * 1024)
         files = {f['path']: decode_cloud_file(f) for f in json.loads(data.split('\n',1)[1])['write_files']}
-        code = bz2.decompress(base64.b85decode(files['/opt/cloud-experiments/code.b85']))
-        package_bytes = io.BytesIO()
-        with zipfile.ZipFile(package_bytes, 'w') as package:
-            while code:
-                name, code = code.split(b'\n', 1)
-                size = int.from_bytes(code[:4], 'big')
-                package.writestr('cloud_experiments/' + name.decode(), code[4:4 + size])
-                code = code[4 + size:]
-        with zipfile.ZipFile(io.BytesIO(package_bytes.getvalue())) as bundle:
+        with tempfile.TemporaryDirectory() as directory:
+            archive = Path(directory) / 'runtime.tar.gz'
+            runtime.build(archive, manifest, {'HCLOUD_WORKER_TOKEN': 'fake-token'}, 'fake-rclone')
+            with tarfile.open(archive, 'r:gz') as contents:
+                package_bytes = contents.extractfile('root/code.zip').read()
+                finalize = contents.extractfile('units/cloud-finalize.service').read()
+        with zipfile.ZipFile(io.BytesIO(package_bytes)) as bundle:
             for name in bundle.namelist():
                 compile(bundle.read(name), name, 'exec')
             self.assertIn('cloud_experiments/persistence.py', bundle.namelist())
             self.assertIn('cloud_experiments/physical.py', bundle.namelist())
         with tempfile.TemporaryDirectory() as directory:
             package = Path(directory) / 'worker.zip'
-            package.write_bytes(package_bytes.getvalue())
+            package.write_bytes(package_bytes)
             result = subprocess.run([sys.executable, '-I', '-c',
                 'import sys; sys.path.insert(0, sys.argv[1]); import cloud_experiments.worker', str(package)],
                 capture_output=True)
             self.assertEqual(result.returncode, 0, result.stderr.decode())
         self.assertNotIn('/etc/systemd/system/cloud-reap.timer', files)
-        self.assertIn(b'TimeoutStartSec=0', files['/etc/systemd/system/cloud-finalize.service'])
-        self.assertIn(b'ExecStart=/usr/bin/python3 /opt/cloud-experiments/entry.py expire',
+        self.assertIn(b'TimeoutStartSec=0', finalize)
+        self.assertIn(b'ExecStart=/usr/bin/python3 /opt/cloud-experiments/failsafe.py',
                       files['/etc/systemd/system/cloud-deadline.service'])
 
 

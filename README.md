@@ -385,8 +385,13 @@ provide generic native/GPU portability. Deletion of the public EWS repository/co
 
 ## Cleanup and security
 
-The first-boot cloud-init payload arms the absolute deadline before package
-installation or source transfer. The deadline includes setup time. Normal
+The small first-boot cloud-init payload arms the absolute deadline before package
+installation or source transfer. Once SSH confirms protection, the laptop uploads
+a checksum-verified runtime with the full worker. Cloud-init size remains stable
+as worker features grow. If the laptop disappears before that upload, the minimal
+failsafe still verifies this VM's identity and deletes it at the deadline. The
+deadline stays armed during installation. This split requires no user action.
+The deadline includes setup time. Normal
 completion, failure, or cancellation stops EWS, attempts final recovery and
 archive publication, then requests immediate VM deletion. An active finalizer
 has no independent wall-clock limit; deletion waits for its publication unless
@@ -409,13 +414,16 @@ ambiguous laptop create failure is recovered using those labels. A failed SSH
 setup requests worker finalization or falls back to checked laptop deletion.
 No volume, snapshot, backup, floating IP, or other persistent resource is created.
 
-Only the dedicated worker token and the selected S3 remote's required credentials
-are transferred, with optional Discord webhook. The laptop's hcloud credentials
+Only the dedicated worker deletion token is present in cloud-init. The selected S3
+remote's credentials and optional Discord webhook arrive after SSH, with the full
+runtime. The laptop's hcloud credentials
 are never copied. Credentials are not in manifests, arguments, or tool logs;
-worker files are root-owned mode 600. Cloud-init receives them through stdin to
-hcloud, with no credential-bearing temporary file. They necessarily pass through
-Hetzner's user-data system and remain in root-only cloud-init state until the VM
-is deleted. Anyone with project administrative access can access a worker;
+worker credential files are root-owned mode 600. Cloud-init receives its token
+through stdin to hcloud, with no credential-bearing temporary file. The token
+passes through Hetzner's user-data system and remains in root-only cloud-init
+state until VM deletion. The runtime archive is held in a private temporary
+directory during upload and removed from the VM after verified installation.
+Anyone with project administrative access can access a worker;
 project-scoped API tokens are not per-server least-privilege tokens. Use a
 dedicated research project and narrowly scoped storage credentials where possible.
 

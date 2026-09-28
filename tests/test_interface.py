@@ -107,7 +107,7 @@ class InterfaceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             c = sample_config(root)
-            payload = bootstrap.render(sample_manifest(c), {"HCLOUD_WORKER_TOKEN": "fake"}, "fake")
+            payload = bootstrap.render(sample_manifest(c), "fake")
             paths = []
             for item in json.loads(payload.split("\n", 1)[1])["write_files"]:
                 if item["path"].startswith("/etc/systemd/system/"):

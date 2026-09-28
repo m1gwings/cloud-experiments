@@ -203,11 +203,29 @@ class LaunchTests(unittest.TestCase):
         self.ssh.call.return_value = subprocess.CompletedProcess([], 0, b"", b"")
 
     def test_launch_transfers_snapshot_and_starts_supervisor(self):
+        events = []
+        self.cloud.create.side_effect = lambda *args: (events.append("create"), server())[1]
+        self.ssh.wait.side_effect = lambda: events.append("armed")
+        self.ssh.upload.side_effect = lambda paths: events.append(
+            "runtime" if paths[0].name == "runtime.tar.gz" else "source")
+        self.ssh.call.side_effect = lambda argv, **kwargs: (
+            events.append("install" if argv[:2] == ["/usr/bin/python3", "-c"]
+                          else "supervisor" if argv == ["systemctl", "start", "cloud-supervisor.service"]
+                          else "poll"), subprocess.CompletedProcess(argv, 0, b"", b""))[1]
         with contextlib.redirect_stdout(io.StringIO()):
             cli.launch(self.c, self.m, self.directory)
         self.storage.upload.assert_called_once()
-        self.ssh.upload.assert_called_once()
+        self.assertEqual(self.ssh.upload.call_count, 2)
+        self.assertEqual(self.ssh.upload.call_args_list[0].args[0][0].name, "runtime.tar.gz")
+        self.ssh.wait.assert_called_once()
+        self.assertTrue(any(call.args[0][:3] == ["/usr/bin/python3", "-c", cli.runtime.INSTALLER]
+                            for call in self.ssh.call.call_args_list))
         self.ssh.call.assert_any_call(["systemctl", "start", "cloud-supervisor.service"])
+        self.assertLess(events.index("create"), events.index("armed"))
+        self.assertLess(events.index("armed"), events.index("runtime"))
+        self.assertLess(events.index("runtime"), events.index("install"))
+        self.assertLess(events.index("install"), events.index("source"))
+        self.assertLess(events.index("source"), events.index("supervisor"))
         self.cloud.delete.assert_not_called()
 
     def test_ambiguous_create_recovers_by_labels_and_deletes_if_ssh_fails(self):
@@ -225,11 +243,18 @@ class LaunchTests(unittest.TestCase):
         self.cloud.create.assert_not_called()
 
     def test_failed_transfer_requests_worker_finalization(self):
-        self.ssh.upload.side_effect = Error("fake transfer failure")
+        self.ssh.upload.side_effect = [None, Error("fake transfer failure")]
         with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(Error):
             cli.launch(self.c, self.m, self.directory)
         self.ssh.call.assert_called_with(["/usr/bin/python3", "/opt/cloud-experiments/entry.py", "setup_failed"], timeout=30)
         self.cloud.delete.assert_not_called()
+
+    def test_runtime_upload_failure_deletes_without_invoking_missing_worker(self):
+        self.ssh.upload.side_effect = Error("fake transfer failure")
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(Error):
+            cli.launch(self.c, self.m, self.directory)
+        self.cloud.delete.assert_called_once_with(server(), "test-run")
+        self.assertFalse(any("entry.py" in str(call) for call in self.ssh.call.call_args_list))
 
     def test_forced_cancellation_requires_confirmation_and_checks_identity(self):
         args = type("Args", (), {"run_id": "test-run", "force_delete": True, "yes": False})()

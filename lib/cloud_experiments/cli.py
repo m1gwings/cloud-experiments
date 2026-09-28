@@ -15,6 +15,7 @@ import time
 from . import __version__
 from .artifacts import artifact_selection
 from .bootstrap import render
+from . import runtime
 from .common import Error, FINAL, SHA_RE, read_json, run_id, sha256, utcnow, valid_result_path, valid_run, write_json
 from .config import DEFAULT_COMMAND, DEPENDENCIES, load, repository_url, run_settings, runtime_hours, storage_credentials, worker_secrets
 from .providers import Hetzner, SSH, Storage
@@ -59,93 +60,116 @@ def launch(config, manifest, directory):
     cloud, storage = Hetzner(config["hetzner"]), Storage(config)
     secrets = worker_secrets(config["local"]["worker_env"])
     rclone = storage_credentials(config["local"]["rclone_config"], config["storage"]["rclone_remote"])
+    # Validate optional runtime credentials and the failsafe before any mutation.
+    from .config import ews_discord_webhook
+    ews_discord_webhook(manifest["settings"], secrets)
     out = directory / "out"
     write_json(directory / "manifest.json", manifest)
     write_json(out / "manifest.json", manifest)
     # Freeze the deadline at creation, after the potentially long preflight upload.
-    payload = render(manifest, secrets, rclone)  # validate size before any provider mutation
+    payload = render(manifest, secrets["HCLOUD_WORKER_TOKEN"])  # before storage or provider mutation
     print(f"Creating run...\nRun:        {rid}\nMachine:    {manifest['machine']}\nEWS:        {manifest['ews']['commit']}\nExperiment: {manifest['experiment']['commit']}")
     if manifest["dirty"]:
         print("DIRTY SOURCE: executing the stored working-tree snapshot.")
     # Store immutable input before provisioning, so even early setup failures are discoverable.
+    (directory / "remote-started").touch()
     storage.upload(out, rid)
     created = dt.datetime.now(dt.timezone.utc)
     manifest["created_at"] = created.isoformat(timespec="seconds")
     manifest["deadline_at"] = (created + dt.timedelta(hours=manifest["max_runtime_hours"])).isoformat(timespec="seconds")
     write_json(directory / "manifest.json", manifest)
-    payload = render(manifest, secrets, rclone)
-    server, ssh, attempted = None, None, False
-    try:
-        attempted = True
-        server = cloud.create(manifest, payload)
-        manifest["server_id"] = server["id"]
-        write_json(directory / "manifest.json", manifest)
-        write_json(out / "manifest.json", manifest)
-        storage.call("copyto", str(out / "manifest.json"), storage.path(rid) + "/manifest.json", timeout=45)
-        ssh = ssh_for(config, server)
-        ssh.wait()
-        print("✓ VM ready (absolute deadline armed)")
-        inputs = [out / "source/source.tar.gz", out / "source/index.json"]
-        if manifest.get("reproduction_environment_sha256"):
-            inputs.append(out / "machine/environment.json")
-        ssh.upload(inputs)
-        print("✓ source uploaded")
-        with Activity("Starting environment setup"):
-            ssh.call(["systemctl", "start", "cloud-supervisor.service"])
-        with Activity("Installing environment and restoring saved progress"):
-            until = time.monotonic() + min(10800, manifest["max_runtime_hours"] * 3600)
-            while time.monotonic() < until:
-                try:
-                    result = ssh.call(["test", "-f", "/opt/cloud-experiments/started"], check=False, timeout=20)
-                    if result.returncode == 0:
-                        launch_message = "✓ environment ready\n✓ experiment started"
-                        break
-                    status = json.loads(ssh.call(["cat", "/opt/cloud-experiments/manifest.json"], timeout=20).stdout)
-                    if status["status"] in FINAL:
-                        if status["status"] == "setup_failed":
-                            raise Error("Worker setup failed; inspect cloud-results pull " + rid)
-                        launch_message = f"Run already finished: {status['status']}"
-                        break
-                except Error:
-                    # Very short runs can delete the server before the next SSH poll.
-                    remote = storage.manifest(rid)
-                    if remote.get("started_at") and remote["status"] in FINAL:
-                        launch_message = f"Run already finished: {remote['status']}"
-                        break
-                    if remote["status"] == "setup_failed":
-                        raise Error("Worker setup failed; inspect cloud-results pull " + rid)
-                    if cloud.find(rid) is None:
-                        raise Error("VM disappeared before launch confirmation; inspect cloud-results pull " + rid)
-                time.sleep(3)
-            else:
-                raise Error("Environment setup did not finish within the launch wait limit.")
-        print(launch_message)
-    except (Exception, KeyboardInterrupt) as exc:
-        # A create call can succeed server-side but fail locally before JSON arrives.
+    payload = render(manifest, secrets["HCLOUD_WORKER_TOKEN"])
+    server, ssh, attempted, runtime_ready = None, None, False, False
+    with tempfile.TemporaryDirectory(prefix="cloud-runtime-") as runtime_dir:
+        archive = Path(runtime_dir) / "runtime.tar.gz"
+        digest = runtime.build(archive, manifest, secrets, rclone)
         try:
-            server = server or (cloud.find(rid) if attempted else None)
-            if server:
-                ssh = ssh or ssh_for(config, server)
-                reason = "cancelled" if isinstance(exc, KeyboardInterrupt) else "setup_failed"
-                try:
-                    with Activity("Requesting worker finalization"):
-                        ssh.call(["/usr/bin/python3", "/opt/cloud-experiments/entry.py", reason], timeout=30)
-                    print("Worker finalization requested; deadline protection remains active.")
-                except Exception:
-                    cloud.delete(server, rid)
-                    print("Unreachable setup worker deleted after identity verification.")
-                    manifest.update(status=reason, finished_at=utcnow(),
-                                    finalization_note="Laptop deleted unreachable worker; only preflight artifacts are guaranteed.")
-                    write_json(out / "manifest.json", manifest)
-                    storage.call("copyto", str(out / "manifest.json"), storage.path(rid) + "/manifest.json", timeout=45)
-        except Exception:
-            print(f"CLEANUP COULD NOT BE CONFIRMED. Run cloud-status {rid}; if needed: cloud-cancel {rid} --force-delete --yes", file=sys.stderr)
-        raise
+            attempted = True
+            server = cloud.create(manifest, payload)
+            manifest["server_id"] = server["id"]
+            write_json(directory / "manifest.json", manifest)
+            write_json(out / "manifest.json", manifest)
+            storage.call("copyto", str(out / "manifest.json"), storage.path(rid) + "/manifest.json", timeout=45)
+            ssh = ssh_for(config, server)
+            ssh.wait()
+            print("✓ VM ready (absolute deadline armed)")
+            with Activity("Installing verified worker runtime"):
+                runtime.install(ssh, archive, digest)
+            runtime_ready = True
+            inputs = [out / "source/source.tar.gz", out / "source/index.json"]
+            if manifest.get("reproduction_environment_sha256"):
+                inputs.append(out / "machine/environment.json")
+            ssh.upload(inputs)
+            print("✓ source uploaded")
+            with Activity("Starting environment setup"):
+                ssh.call(["systemctl", "start", "cloud-supervisor.service"])
+            with Activity("Installing environment and restoring saved progress"):
+                until = time.monotonic() + min(10800, manifest["max_runtime_hours"] * 3600)
+                while time.monotonic() < until:
+                    try:
+                        result = ssh.call(["test", "-f", "/opt/cloud-experiments/started"], check=False, timeout=20)
+                        if result.returncode == 0:
+                            launch_message = "✓ environment ready\n✓ experiment started"
+                            break
+                        status = json.loads(ssh.call(["cat", "/opt/cloud-experiments/manifest.json"], timeout=20).stdout)
+                        if status["status"] in FINAL:
+                            if status["status"] == "setup_failed":
+                                raise Error("Worker setup failed; inspect cloud-results pull " + rid)
+                            launch_message = f"Run already finished: {status['status']}"
+                            break
+                    except Error:
+                        # Very short runs can delete the server before the next SSH poll.
+                        remote = storage.manifest(rid)
+                        if remote.get("started_at") and remote["status"] in FINAL:
+                            launch_message = f"Run already finished: {remote['status']}"
+                            break
+                        if remote["status"] == "setup_failed":
+                            raise Error("Worker setup failed; inspect cloud-results pull " + rid)
+                        if cloud.find(rid) is None:
+                            raise Error("VM disappeared before launch confirmation; inspect cloud-results pull " + rid)
+                    time.sleep(3)
+                else:
+                    raise Error("Environment setup did not finish within the launch wait limit.")
+            print(launch_message)
+        except (Exception, KeyboardInterrupt) as exc:
+            # A create call can succeed server-side but fail locally before JSON arrives.
+            try:
+                server = server or (cloud.find(rid) if attempted else None)
+                if server:
+                    ssh = ssh or ssh_for(config, server)
+                    reason = "cancelled" if isinstance(exc, KeyboardInterrupt) else "setup_failed"
+                    try:
+                        if not runtime_ready:
+                            raise Error("Full worker is not installed.")
+                        with Activity("Requesting worker finalization"):
+                            ssh.call(["/usr/bin/python3", "/opt/cloud-experiments/entry.py", reason], timeout=30)
+                        print("Worker finalization requested; deadline protection remains active.")
+                    except Exception:
+                        cloud.delete(server, rid)
+                        print("Setup worker deleted after identity verification.")
+                        manifest.update(status=reason, finished_at=utcnow(),
+                                        finalization_note="Laptop deleted unreachable worker; only preflight artifacts are guaranteed.")
+                        write_json(out / "manifest.json", manifest)
+                        storage.call("copyto", str(out / "manifest.json"), storage.path(rid) + "/manifest.json", timeout=45)
+            except Exception:
+                print(f"CLEANUP COULD NOT BE CONFIRMED. Run cloud-status {rid}; if needed: cloud-cancel {rid} --force-delete --yes", file=sys.stderr)
+            raise
     print(f"\nAttach:\n  cloud-attach {rid}\n\nStatus:\n  cloud-status {rid}")
     return rid
 
 
 def run_command(args, config):
+    provisional_dirs = []
+    try:
+        return _run_command(args, config, provisional_dirs)
+    finally:
+        # An entirely local preflight has no remote evidence to preserve.
+        for directory in provisional_dirs:
+            if directory.exists() and not (directory / "remote-started").exists():
+                shutil.rmtree(directory)
+
+
+def _run_command(args, config, provisional_dirs):
     # Local state must never dirty or disclose credentials into the experiment tree.
     from .source import git
     root = Path(git("rev-parse", "--show-toplevel", cwd=Path.cwd()))
@@ -153,6 +177,7 @@ def run_command(args, config):
         raise Error("local.state_dir must be outside the experiment repository.")
     rid = run_id(args.name or Path(args.experiment_config).stem)
     directory = state(config, rid)
+    provisional_dirs.append(directory)
     out = directory / "out"
     (out / "source").mkdir(parents=True)
     with Activity("Preparing source snapshot"):
@@ -197,6 +222,7 @@ def run_command(args, config):
     destination = Path(config["local"]["state_dir"]) / rid
     directory.rename(destination)
     directory = destination
+    provisional_dirs.append(directory)
     manifest["run_id"] = rid
     print(f"Study: {sid}\nAttempt: {rid}")
     launch(config, manifest, directory)

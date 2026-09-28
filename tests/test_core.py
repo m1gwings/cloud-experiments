@@ -118,12 +118,14 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(m["status"], "provisioning")
 
     def test_bootstrap_arms_absolute_deadline_before_setup(self):
-        payload = bootstrap.render(sample_manifest(self.c), {"HCLOUD_WORKER_TOKEN": "FAKE-BOOT-TOKEN"}, "FAKE-RCLONE")
-        self.assertLessEqual(len(payload.encode()), 32768)
+        payload = bootstrap.render(sample_manifest(self.c), "FAKE-BOOT-TOKEN")
+        self.assertLessEqual(len(payload.encode()), 24 * 1024)
         data = json.loads(payload.split("\n", 1)[1])
         files = {x["path"]: x for x in data["write_files"]}
-        self.assertEqual(files["/opt/cloud-experiments/credentials.json"]["permissions"], "0600")
-        self.assertEqual(files["/opt/cloud-experiments/rclone.conf"]["permissions"], "0600")
+        self.assertEqual(files["/opt/cloud-experiments/failsafe-token"]["permissions"], "0600")
+        self.assertNotIn("/opt/cloud-experiments/rclone.conf", files)
+        self.assertNotIn("/opt/cloud-experiments/credentials.json", files)
+        self.assertNotIn("/opt/cloud-experiments/code.zip", files)
         self.assertNotIn("FAKE-BOOT-TOKEN", payload)
         self.assertNotIn("apt-get", json.dumps(data["runcmd"]))
         self.assertIn("cloud-deadline.timer", json.dumps(data["runcmd"]))
