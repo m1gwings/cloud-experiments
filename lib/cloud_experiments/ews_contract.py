@@ -146,9 +146,9 @@ def query(worker, expected=None):
     return actual
 
 
-def create_snapshot(worker, output, destination):
+def create_snapshot(worker, output, destination, *, timeout=1200):
     """Seal a stopped writer through EWS; no private filesystem interpretation."""
-    worker.user_step(["python", "-c", CREATE_SCRIPT, str(output), str(destination)])
+    worker.user_step(["python", "-c", CREATE_SCRIPT, str(output), str(destination)], timeout=timeout)
     return validate_manifest(read_json(Path(destination) / MANIFEST))
 
 

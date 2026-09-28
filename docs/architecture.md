@@ -60,7 +60,8 @@ configuration belong in experiment repositories.
    finalizer. It stops setup, asks EWS to checkpoint through SIGINT with 90 seconds
    grace, then stops the experiment cgroup. It runs the same recovery sync one
    final time, collects other workspace deltas, and publishes final archive state
-   only after verification. Small lifecycle records precede large operations and
+   only after verification. Final snapshot and transfer subprocesses have no
+   independent wall-clock limit. Small lifecycle records precede large operations and
    carry failures independently of artifact transfer.
 7. Discord distinguishes compute, recovery, archive and deletion requests. It is
    bounded and cannot prevent deletion. The deletion service independently

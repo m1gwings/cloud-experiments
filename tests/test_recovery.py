@@ -103,8 +103,8 @@ class RecoveryTests(unittest.TestCase):
         write_json(self.output / 'metadata.json', {'revision': 1})
         self.large = b'unchanging retained payload' * 2000
         (self.output / 'durable.bin').write_bytes(self.large)
-        self.create = patch.object(ews_contract, 'create_snapshot', side_effect=lambda w, src, dst: sealed_snapshot(src, dst))
-        self.create.start()
+        self.create = patch.object(ews_contract, 'create_snapshot', side_effect=lambda w, src, dst, **kwargs: sealed_snapshot(src, dst))
+        self.snapshot_api = self.create.start()
         self.addCleanup(self.create.stop)
         self.restore_api = patch.object(ews_contract, 'restore_snapshot', side_effect=self.restore_bytes)
         self.restore_api.start()
@@ -259,6 +259,13 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(final['provenance']['cloud'], self.manifest['tooling'])
         self.assertEqual(self.manifest['status'], 'finalizing')
         self.assertFalse((self.worker.out / 'artifacts/output').exists())
+
+    def test_final_snapshot_and_publication_have_no_subprocess_wall_clock(self):
+        self.worker.rclone = Mock(side_effect=self.storage)
+        self.sync(final=True)
+        self.assertIsNone(self.snapshot_api.call_args.kwargs['timeout'])
+        self.assertTrue(self.worker.rclone.call_args_list)
+        self.assertTrue(all(call.kwargs['timeout'] is None for call in self.worker.rclone.call_args_list))
 
     def test_failed_commit_readback_is_idempotently_recovered(self):
         committed = []

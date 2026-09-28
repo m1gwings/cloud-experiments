@@ -269,7 +269,7 @@ class StateRoundTripTests(unittest.TestCase):
         self.w = self.make_worker('first', self.m)
         self.w.upload(self.m)  # Laptop preflight creates the study prefix before VM setup.
         from test_recovery import sealed_snapshot
-        create = patch.object(persistence.ews_contract, 'create_snapshot', side_effect=lambda w, src, dst: sealed_snapshot(src, dst))
+        create = patch.object(persistence.ews_contract, 'create_snapshot', side_effect=lambda w, src, dst, **kwargs: sealed_snapshot(src, dst))
         create.start()
         self.addCleanup(create.stop)
         restore = patch.object(persistence.ews_contract, 'restore_snapshot', side_effect=lambda w, src, dst: shutil.copytree(Path(src)/'output', dst))

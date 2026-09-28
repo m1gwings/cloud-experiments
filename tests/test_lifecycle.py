@@ -124,14 +124,17 @@ class WorkerTests(unittest.TestCase):
     def test_upload_verifies_artifacts_before_publishing_manifest(self):
         self.w.save(self.m)
         calls = []
+        timeouts = []
 
         def rclone(*args, **kwargs):
             calls.append(args)
+            timeouts.append(kwargs["timeout"])
             return subprocess.CompletedProcess([], 0, json.dumps(self.w.manifest()).encode(), b"")
 
         with patch.object(self.w, "rclone", side_effect=rclone):
             self.w.upload(self.m, final=True)
         self.assertEqual([x[0] for x in calls], ["copy", "check", "copyto", "cat"])
+        self.assertEqual(timeouts, [None] * 4)
         self.assertEqual(self.m["upload"]["status"], "verified")
 
     def test_execute_preserves_tty_and_exit_status_without_secret_environment(self):

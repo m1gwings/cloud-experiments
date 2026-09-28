@@ -162,12 +162,12 @@ class Worker:
     def upload(self, manifest, final=False):
         """Upload payload first, verify it, publish the authoritative manifest last."""
         remote = remote_path(manifest["storage"], manifest["run_id"])
-        self.rclone("copy", str(self.out), remote, "--exclude", "/manifest.json", timeout=360)
-        self.rclone("check", str(self.out), remote, "--exclude", "/manifest.json", "--one-way", timeout=120)
+        self.rclone("copy", str(self.out), remote, "--exclude", "/manifest.json", timeout=None if final else 360)
+        self.rclone("check", str(self.out), remote, "--exclude", "/manifest.json", "--one-way", timeout=None if final else 120)
         manifest["upload"] = {"status": "verified", "verified_at": utcnow()}
         self.save(manifest)
-        self.rclone("copyto", str(self.out / "manifest.json"), remote + "/manifest.json", timeout=45)
-        content = json.loads(self.rclone("cat", remote + "/manifest.json", timeout=30).stdout)
+        self.rclone("copyto", str(self.out / "manifest.json"), remote + "/manifest.json", timeout=None if final else 45)
+        content = json.loads(self.rclone("cat", remote + "/manifest.json", timeout=None if final else 30).stdout)
         if content != manifest:
             raise Error("Uploaded manifest verification failed.")
 
@@ -427,7 +427,7 @@ class Worker:
                 m["archive"] = {"status": "published", "published_at": utcnow()}
                 self.save(m)
                 remote = remote_path(m["storage"], m["run_id"]) + "/manifest.json"
-                self.rclone("copyto", str(self.out / "manifest.json"), remote, timeout=30)
+                self.rclone("copyto", str(self.out / "manifest.json"), remote, timeout=None)
                 self.publish_lifecycle(m)
                 notify(m, self.secrets())
                 write_json(done, reason)

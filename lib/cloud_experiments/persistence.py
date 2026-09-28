@@ -53,10 +53,10 @@ def _read_history(call, root, study):
     return commits, environment
 
 
-def read_head(worker, manifest):
+def read_head(worker, manifest, call=None):
     """Discover the compatible lineage and environment before EWS installation."""
     root = remote_path(manifest["storage"], manifest["study_id"])
-    commits, environment = _read_history(worker.rclone, root, manifest["study_id"])
+    commits, environment = _read_history(call or worker.rclone, root, manifest["study_id"])
     return state_head(manifest["study_id"], commits), environment
 
 
@@ -168,7 +168,7 @@ def restore(worker, manifest):
     return environment
 
 
-def prepare(worker, manifest):
+def prepare(worker, manifest, final=False):
     """Seal the stopped writer through EWS; its v1 API requires a local copy."""
     if not (worker.base / "environment-ready.json").exists():
         return None
@@ -185,7 +185,10 @@ def prepare(worker, manifest):
     destination = worker.work / "runtime" / ("recovery-" + uuid.uuid4().hex)
     destination.parent.mkdir(parents=True, exist_ok=True)
     try:
-        ews_contract.create_snapshot(worker, output, destination)
+        if final:
+            ews_contract.create_snapshot(worker, output, destination, timeout=None)
+        else:
+            ews_contract.create_snapshot(worker, output, destination)
         return destination
     except BaseException:
         shutil.rmtree(destination, ignore_errors=True)
@@ -235,7 +238,7 @@ def _digests(recovery):
     return {descriptor["sha256"] for descriptor in recovery["files"].values()}
 
 
-def _prune(worker, root, commits, head, retained):
+def _prune(call, root, commits, head, retained):
     """Delete only superseded committed content, retaining the current recovery.
 
     EWS's sealed inventory validates intentional pruning and incomplete tails.
@@ -249,12 +252,12 @@ def _prune(worker, root, commits, head, retained):
                         if head and commit["commit_id"] == head.get("parent")), None)
     if predecessor is None:
         return
-    obsolete = _digests(read_snapshot(worker.rclone, root, predecessor)) - retained
+    obsolete = _digests(read_snapshot(call, root, predecessor)) - retained
     for digest in sorted(obsolete):
         blob = root + "/blobs/" + digest
-        entry = json.loads(worker.rclone("lsjson", blob, "--stat", timeout=30).stdout)
+        entry = json.loads(call("lsjson", blob, "--stat", timeout=30).stdout)
         if not entry.get("IsDir") and entry.get("Path") == digest:
-            worker.rclone("deletefile", blob, timeout=60)
+            call("deletefile", blob, timeout=60)
 
 
 def sync(worker, manifest, snapshot=None, final=False):
@@ -264,23 +267,26 @@ def sync(worker, manifest, snapshot=None, final=False):
     resumes. Transfer failures leave its previous remote recovery usable.
     """
     owned = snapshot is None
-    snapshot = prepare(worker, manifest) if owned else Path(snapshot)
+    snapshot = prepare(worker, manifest, final=final) if owned else Path(snapshot)
     if snapshot is None:
         return None
     try:
+        def call(*args, timeout=180):
+            return worker.rclone(*args, timeout=None if final else timeout)
+
         recovery = ews_contract.validate_manifest(read_json(snapshot / "recovery.json"))
         for name in recovery["files"]:
             if secret_path(name):
                 raise Error("Recovery snapshot contains a secret-like file; refusing upload.")
         worker.verify_lease(manifest)
         root = remote_path(manifest["storage"], manifest["study_id"])
-        commits, _ = _read_history(worker.rclone, root, manifest["study_id"])
+        commits, _ = _read_history(call, root, manifest["study_id"])
         head = state_head(manifest["study_id"], commits)
         recovered = head is not None and head == manifest.get("pending_recovery")
         current = _fence(worker, manifest, head)
         if recovered and head["snapshot_id"] == recovery["snapshot_id"] and head["final"] == final:
             return head
-        previous = read_snapshot(worker.rclone, root, head) if head else None
+        previous = read_snapshot(call, root, head) if head else None
         previous_digests = _digests(previous) if previous else set()
         candidate_digests = _digests(recovery)
         commit = _commit(manifest, recovery, sha256(snapshot / "recovery.json"), current, final)
@@ -299,25 +305,25 @@ def sync(worker, manifest, snapshot=None, final=False):
                         raise Error("Sealed recovery payload changed before synchronization.")
                     os.link(source, target)
             if any(transfer.iterdir()):
-                worker.rclone("copy", str(transfer), root + "/blobs", "--ignore-times", timeout=1800)
-                worker.rclone("check", str(transfer), root + "/blobs", "--one-way", "--download", timeout=1800)
+                call("copy", str(transfer), root + "/blobs", "--ignore-times", timeout=1800)
+                call("check", str(transfer), root + "/blobs", "--one-way", "--download", timeout=1800)
         # The EWS marker is published only after all of its payload is verified.
         marker = root + "/snapshots/" + recovery["snapshot_id"] + "/recovery.json"
-        worker.rclone("copyto", str(snapshot / "recovery.json"), marker, timeout=45)
-        read_snapshot(worker.rclone, root, commit)
+        call("copyto", str(snapshot / "recovery.json"), marker, timeout=45)
+        read_snapshot(call, root, commit)
         # Recheck ownership and parent immediately before destructive/publication effects.
         worker.verify_lease(manifest)
-        latest, _ = read_head(worker, manifest)
+        latest, _ = read_head(worker, manifest, call=call)
         if (latest["commit_id"] if latest else None) != current:
             raise Error("Study recovery parent changed during synchronization; refusing publication.")
-        _prune(worker, root, commits, head, previous_digests | candidate_digests)
+        _prune(call, root, commits, head, previous_digests | candidate_digests)
         commit["committed_at"] = utcnow()
         worker.save(manifest)  # Persist the exact pending marker before its remote write.
         path = worker.base / "recovery-commit.json"
         write_json(path, commit)
         remote = root + "/commits/" + commit["commit_id"] + ".json"
-        worker.rclone("copyto", str(path), remote, timeout=45)
-        if json.loads(worker.rclone("cat", remote, timeout=30).stdout) != commit:
+        call("copyto", str(path), remote, timeout=45)
+        if json.loads(call("cat", remote, timeout=30).stdout) != commit:
             raise Error("Study recovery publication verification failed.")
         _accept(worker, manifest, commit)
         return commit

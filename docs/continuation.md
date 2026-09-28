@@ -100,9 +100,10 @@ Each synchronization:
 
 History discovery lists only the flat commit and environment prefixes. Pruning
 checks each obsolete digest directly before deletion. Neither operation needs a
-recursive listing of the growing study object pool. Blob copy and verification
-have separate bounded transfer windows. The finalizer can finish those windows
-while the absolute deadline is still in the future.
+recursive listing of the growing study object pool. Periodic transfers keep
+bounded subprocess windows. Final snapshot creation, recovery publication and
+archive transfer have no separate wall-clock limit; the absolute deadline stops
+an unfinished finalizer.
 
 Pruning deliberately lags by one successful synchronization. This preserves the
 previous complete recovery point if deletion or publication is interrupted.

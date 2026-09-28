@@ -142,6 +142,10 @@ class StreamingCommandTests(unittest.TestCase):
     def execute(self, code, **kwargs):
         return command([sys.executable, "-c", code], **kwargs)
 
+    def test_streamed_command_can_rely_on_external_deadline(self):
+        result = self.execute("print('finished')", stderr_line=lambda line: None, timeout=None)
+        self.assertEqual(result.stdout, b"finished\n")
+
     def test_streams_before_exit_preserves_both_pipes_and_filters_environment(self):
         with tempfile.TemporaryDirectory() as tmp:
             gate = Path(tmp) / "continue"

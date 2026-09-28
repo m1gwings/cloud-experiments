@@ -82,7 +82,7 @@ def _stream_command(argv, *, cwd, input, timeout, env, stderr_line):
         output, errors = bytearray(), bytearray()
         pending = bytearray()
         oversized = False
-        deadline = time.monotonic() + timeout
+        deadline = None if timeout is None else time.monotonic() + timeout
         try:
             with selectors.DefaultSelector() as selector:
                 selector.register(process.stdout, selectors.EVENT_READ, output)
@@ -93,10 +93,10 @@ def _stream_command(argv, *, cwd, input, timeout, env, stderr_line):
                 elif process.stdin:
                     process.stdin.close()
                 while selector.get_map():
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
+                    remaining = None if deadline is None else deadline - time.monotonic()
+                    if remaining is not None and remaining <= 0:
                         raise subprocess.TimeoutExpired(argv, timeout)
-                    for key, _ in selector.select(min(remaining, 0.2)):
+                    for key, _ in selector.select(0.2 if remaining is None else min(remaining, 0.2)):
                         if key.fileobj is process.stdin:
                             try:
                                 sent = os.write(key.fd, key.data[:4096])
@@ -128,7 +128,7 @@ def _stream_command(argv, *, cwd, input, timeout, env, stderr_line):
                                     pending.clear()
                 if pending and not oversized:
                     stderr_line(bytes(pending))
-                process.wait(timeout=max(0, deadline - time.monotonic()))
+                process.wait(timeout=None if deadline is None else max(0, deadline - time.monotonic()))
         except BaseException:
             # Stop the transfer (and any helpers) on timeout or Ctrl-C, then reap it.
             try:
