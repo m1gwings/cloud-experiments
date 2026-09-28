@@ -285,6 +285,12 @@ and resolve paths relative to its parent. EWS owns these paths; cloud-experiment
 has no mapping of EWS internal figure/analysis/report locations. The small
 catalog is fetched in addition to the file listing; unrelated result contents
 are not downloaded. `ls` reads recovery metadata to expose logical output paths.
+For EWS custom figures partitioned by aggregation labels, completed plots may
+appear while other simulation groups are still running. They become available
+through `--plots` after a periodic recovery snapshot containing them is committed;
+this command does not read the VM's live filesystem. Per-group summaries can be
+retrieved with `--analysis` after that same commit, while the combined summary
+CSV is exported when EWS finishes the invocation.
 
 The supported [EWS contract](https://github.com/m1gwings/experiments-wo-stress/blob/main/docs/ARTIFACTS.md)
 is `schema: "experiments-wo-stress/artifacts"`, integer `schema_version: 1`, and
