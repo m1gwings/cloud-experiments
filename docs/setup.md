@@ -178,7 +178,7 @@ bucket = "migwings-experiments"
 
 [ews]
 repository = "https://github.com/m1gwings/experiments-wo-stress.git"
-default_ref = "057cc62ea162d6ac22af224b8cff8166da4a11d8"
+default_ref = "67c3d1b729a697ae0e104e3e81c3b93e73917d09"
 
 [run]
 sync_seconds = 300
@@ -322,6 +322,9 @@ cloud-results list
 cloud-results pull RUN_ID
 cloud-status
 ```
+
+For list commands, storage loading progress finishes before the table heading
+and rows are printed.
 
 Inspect the final manifest, source/config checksums, logs, and output artifacts.
 Confirm in both `cloud-status` and Hetzner Console that the VM disappeared. Once

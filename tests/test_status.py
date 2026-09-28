@@ -76,6 +76,22 @@ class StatusTests(unittest.TestCase):
         row = self.invoke("cloud-status")
         self.assertEqual(row["STATUS"], "interrupted")
 
+    def test_loading_output_precedes_status_table_for_both_list_commands(self):
+        def loading_manifests():
+            print("Loading stored runs")
+            yield self.manifest
+
+        self.storage.manifests.side_effect = loading_manifests
+        for command, arguments in (("cloud-status", []), ("cloud-results", ["list"])):
+            with self.subTest(command=command):
+                self.output.seek(0)
+                self.output.truncate()
+                self.invoke(command, *arguments)
+                lines = self.output.getvalue().splitlines()
+                self.assertEqual(lines[0], "Loading stored runs")
+                self.assertEqual(lines[1], cli.STATUS_HEADER)
+                self.assertTrue(lines[2].startswith("test-run\t"))
+
     def test_periodic_failure_keeps_last_success_visible_while_compute_runs(self):
         self.cloud.servers.return_value = [server()]
         self.manifest["sync"] = {"status": "failed"}

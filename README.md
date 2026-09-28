@@ -37,7 +37,7 @@ project, `nbg1`, and `migwings-experiments` bucket described there.
 | `cloud-run CONFIG` | Continue the repository/config study; restore verified state, or skip compute if exactly completed. |
 | `cloud-results list --attempts STUDY_ID` | Inspect all attempts of a logical study. |
 | `cloud-attach RUN_ID` | Attach to the active experiment's tmux terminal. |
-| `cloud-status [RUN_ID]` | Show compute, recovery, archive and VM state; absent active workers are `interrupted`. |
+| `cloud-status [RUN_ID]` | Show compute, recovery, archive and VM state after loading the stored run list; absent active workers are `interrupted`. |
 | `cloud-results list` | Show stored studies with current VM presence and separate persistence outcomes. |
 | `cloud-results ls RUN_ID [--json]` | Recursively list remote file paths and sizes without downloading contents. |
 | `cloud-results pull RUN_ID [--dest PATH]` | Download study inputs/history/current output, an attempt, or a legacy run, by default to `~/cloud-results/RUN_ID`. |

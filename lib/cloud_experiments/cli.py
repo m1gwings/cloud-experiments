@@ -325,7 +325,6 @@ def status(args, config):
         valid_run(args.run_id)
     storage = Storage(config)
     servers = managed_servers(config)
-    print(STATUS_HEADER)
     if args.run_id:
         rid = valid_run(args.run_id)
         manifests = [storage.manifest(rid)]
@@ -338,6 +337,7 @@ def status(args, config):
                 path = Path(config["local"]["state_dir"]) / rid / "manifest.json"
                 manifests.append(read_json(path) if path.exists() else {
                     "run_id": rid, "machine": server["server_type"]["name"], "status": "unknown"})
+    print(STATUS_HEADER)
     for manifest in manifests:
         print_row(manifest, matching_server(manifest, servers), provider_known=servers is not None)
 
@@ -415,12 +415,12 @@ def results(args, config):
     if args.operation == "list":
         if args.attempts and not STUDY_RE.fullmatch(args.attempts):
             raise Error("--attempts requires a logical study ID.")
-        print(STATUS_HEADER)
         servers = managed_servers(config)
-        manifests = storage.manifests()
+        manifests = list(storage.manifests())
         if args.attempts:
             history = storage.study_manifest(args.attempts)["attempts"]
-            manifests = (storage.manifest(attempt["run_id"]) for attempt in history)
+            manifests = [storage.manifest(attempt["run_id"]) for attempt in history]
+        print(STATUS_HEADER)
         for manifest in manifests:
             print_row(manifest, matching_server(manifest, servers), provider_known=servers is not None)
     elif args.operation == "ls":
