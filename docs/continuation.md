@@ -31,7 +31,7 @@ when they expose the explicitly supported contract. The laptop checks the fetche
 public declarations before creating compute; the worker queries the installed API
 again. Manifests, recovery commits and sync metadata retain the contract version.
 
-EWS owns the [recovery contract and snapshot API](https://github.com/m1gwings/experiments-wo-stress/blob/67c3d1b729a697ae0e104e3e81c3b93e73917d09/docs/CLOUD.md#versioned-recovery-snapshots).
+EWS owns the [recovery contract and snapshot API](https://github.com/m1gwings/experiments-wo-stress/blob/d1bbe748f590d89cbdf9df6513a854c58108a554/docs/CLOUD.md#versioned-recovery-snapshots).
 Cloud code consumes its sealed inventory instead of interpreting checkpoint,
 trajectory or analysis directories. Unknown contracts fail closed. Older cloud
 state without this contract remains browsable, but cannot silently become a
@@ -69,8 +69,10 @@ not specified here:
 ```text
 studies/STUDY_ID/
   environments/ATTEMPT_ID.json
-  blobs/SHA256
+  blobs/SHA256                         # standalone content, including older loose blobs
+  packs/PACK_SHA256.tar                 # immutable small-object containers
   snapshots/SNAPSHOT_ID/recovery.json
+  snapshots/SNAPSHOT_ID/layout-COMMIT_ID.json.gz
   commits/COMMIT_ID.json
   attempts/ATTEMPT_ID/
     manifest.json
@@ -87,19 +89,27 @@ commits per attempt. Missing parents, competing heads and disconnected histories
 fail closed. No mutable latest pointer decides the winner. Content-addressed
 objects share unchanged bytes across syncs and attempts; EWS's manifest preserves
 paths, empty directories and intentional pruning receipts.
+The EWS recovery v1 inventory remains a logical path-to-SHA-256-and-size map.
+Cloud's checksummed, versioned physical layout maps each required digest to a
+standalone blob or pack. Commits without a layout use the original loose-blob
+representation. A later commit can combine reused loose blobs and new packs;
+old commits are not rewritten or repacked before continuation. Unsupported or
+damaged layouts fail closed.
 
 Each synchronization:
 
 1. Uses EWS's sealed inventory, with secret-path and regular-file checks.
-2. Uploads newly required content and verifies transferred bytes by downloading
-   for comparison; S3 multipart ETags are not assumed to be SHA-256 hashes.
-3. Publishes and reads back the sealed EWS snapshot manifest.
-4. Rechecks the provider lease and parent. Prunes obsolete committed objects
+2. Reuses known parent locations. New payloads below 64 KiB are streamed into
+   uncompressed immutable packs near 8 MiB; larger payloads remain standalone.
+   Uploads are checked by downloading bytes for comparison, without trusting
+   S3 multipart ETags.
+3. Publishes and reads back the sealed EWS manifest and cloud physical layout.
+4. Rechecks the provider lease and parent. Prunes only older committed containers
    referenced by neither the previous recovery point nor the candidate.
-5. Publishes and reads back the new cloud recovery commit last.
+5. Publishes and reads back the authoritative cloud recovery commit last.
 
 History discovery lists only the flat commit and environment prefixes. Pruning
-checks each obsolete digest directly before deletion. Neither operation needs a
+checks each obsolete committed container directly before deletion. Neither operation needs a
 recursive listing of the growing study object pool. Periodic transfers keep
 bounded subprocess windows. Final snapshot creation, recovery publication and
 archive transfer have no separate wall-clock limit; the absolute deadline stops
@@ -113,9 +123,12 @@ live file alone never authorizes deletion. Unknown orphan uploads are retained
 conservatively. Historical commit metadata survives, but arbitrary older output
 snapshots are not permanent archives. Download results you need to retain before
 later study evolution prunes them. The latest committed snapshot remains complete.
+An immutable pack stays while any retained recovery references one member;
+packing does not aggressively repack partly live containers.
 
-Restore downloads precisely the selected inventory in a bounded parallel batch
-into an isolated directory, verifies every hash and size, then invokes EWS's
+Restore resolves physical locations once and downloads each required pack at most
+once into an isolated directory. It rejects unsafe archive members, verifies each
+materialized digest and size, then invokes EWS's
 atomic restore into a new output tree. It never merges old remote tails into
 restored output. EWS then performs
 ordinary checkpoint verification/fallback, selection, invalidation and
@@ -123,9 +136,9 @@ rematerialization. A damaged transfer fails before scientific execution.
 EWS may report a committed run checkpoint before the next cloud recovery commit.
 Only a published cloud recovery commit is available after VM loss; the on-worker
 checkpoint message alone does not establish that remote durability.
-Large recoveries can contain many small blobs. Restore lists the blob pool once
-and filters it to the committed inventory, avoiding a lookup for each blob;
-small result selections use direct lookups. The download has a two-hour limit,
+Selective requests extract only requested pack members, although one tiny file
+can require downloading its entire modest pack. Loose files use direct lookups
+for small selections or one filtered batch for large selections. The download has a two-hour limit,
 and the launcher waits up to three hours for setup and restore (or the
 attempt's shorter runtime limit). Both are ceilings, not delays; the attempt
 still has its original deadline and setup time counts toward it.
@@ -197,8 +210,10 @@ An abnormal finalizer exit, a caught synchronization error, or an absolute
 deadline that interrupts finalization produces a failure capsule under that
 attempt. Its stage and last committed recovery are diagnostic observations, not
 new recovery state. The previous verified commit remains authoritative until a
-new recovery marker and commit are published. Systemd captures process failures
-before requesting deletion; capture has a short timeout and deletion remains
+new recovery marker and commit are published. The centralized stage record
+identifies `recovery.build_packs`, `recovery.upload`, `recovery.verify`, and
+`recovery.publish_layout` failures. Systemd captures process failures before
+requesting deletion; capture has a short timeout and deletion remains
 idempotent. `cloud-diagnose ATTEMPT_ID` reads the latest complete capsule;
 `--journal` shows its bounded redacted journal. A missing capsule does not make
 a legacy attempt unusable.

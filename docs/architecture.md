@@ -18,7 +18,8 @@ shared package in `lib/cloud_experiments` has no third-party Python dependencies
 | `environment.py` | Safe exact environment capture, requirements and validation. |
 | `ews_contract.py` | Explicit supported EWS recovery envelope and public API adapter. |
 | `provenance.py` | Cloud implementation revision and content fingerprint. |
-| `persistence.py` | Shared content objects, verified recovery restore, pruning and commits. |
+| `persistence.py` | Verified recovery transfer, restore, delayed pruning and commits. |
+| `physical.py` | Immutable packed containers and checked cloud physical layouts; EWS inventory stays logical. |
 | `synchronization.py` | Cooperative periodic pause, seal, resume and retry. |
 | `diagnostics.py` | Validated failure capsule schema, selected lifecycle fields and bounded redaction. |
 | `worker.py` | Installation, PTY execution, supervision, finalization, direct API deletion. |
@@ -168,7 +169,12 @@ is headerless TSV, and `--json` provides structured records. Paths are validated
 before rendering to keep controls/traversal out of terminal output and downloads.
 
 Modern recovery pulls materialize only the selected committed inventory from
-content-addressed objects, verifying SHA-256 and sizes. Listings expose logical
+content-addressed loose objects or packed containers, verifying SHA-256 and sizes
+for every materialized member. The checked physical layout is cloud-owned and
+published before the authoritative commit. Descriptor-free older commits use
+loose blobs, and mixed lineages require no migration. Pack garbage collection
+waits until no retained state references a member; unknown uploads are untouched.
+Listings expose logical
 `artifacts/output` paths rather than implementation object keys. Study semantic
 pulls select the authoritative committed snapshot first.
 Legacy semantic pulls discover a unique `artifacts.json` under captured `artifacts/`

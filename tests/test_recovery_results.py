@@ -12,7 +12,7 @@ import unittest
 
 from test_core import sample_config, sample_manifest
 from test_results import INDEX
-from cloud_experiments import cli, ews_contract, studies
+from cloud_experiments import cli, ews_contract, physical, studies
 from cloud_experiments.common import Error, sha256, write_json
 from cloud_experiments.providers import Storage
 
@@ -69,6 +69,50 @@ class RecoveryResultTests(unittest.TestCase):
                   "provenance": {"ews": {"commit": "d" * 40}, "cloud": {"version": "test"}}}
         write_json(self.study_root / "commits" / (commit["commit_id"] + ".json"), commit)
         return commit, recovery
+
+    def pack_snapshot(self, commit, recovery):
+        sources = {entry['sha256']: (self.study_root / 'blobs' / entry['sha256'], entry['size'])
+                   for entry in recovery['files'].values()}
+        temporary = self.root / 'building.tar'
+        digest = physical.pack_sources(sources, temporary)
+        target = self.study_root / 'packs' / (digest + '.tar')
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary.rename(target)
+        for source, _ in sources.values():
+            source.unlink()
+        layout = {'loose': set(), 'packs': {digest: set(sources)}}
+        raw = physical.encode(recovery['snapshot_id'], layout)
+        path = self.study_root / 'snapshots' / recovery['snapshot_id'] / ('layout-' + commit['commit_id'] + '.json.gz')
+        path.write_bytes(raw)
+        commit['layout_sha256'] = hashlib.sha256(raw).hexdigest()
+        write_json(self.study_root / 'commits' / (commit['commit_id'] + '.json'), commit)
+        return digest
+
+    def test_packed_result_listing_and_selective_download_fetch_pack_once(self):
+        commit, recovery = self.snapshot(1, {'exports/charts/a.pdf': b'a', 'exports/charts/b.pdf': b'b'})
+        self.pack_snapshot(commit, recovery)
+        paths = {entry['path'] for entry in self.storage.files(self.study)}
+        self.assertIn('artifacts/output/exports/charts/a.pdf', paths)
+        self.assertFalse(any(path.startswith(('packs/', 'blobs/', 'snapshots/')) for path in paths))
+        self.calls.clear()
+        destination = self.root / 'packed-selected'
+        self.storage.pull_paths(self.study, destination,
+                                ['artifacts/output/exports/charts/a.pdf', 'artifacts/output/exports/charts/b.pdf'])
+        downloads = [args for args in self.calls if args[0] == 'copy' and str(args[1]).endswith('/packs')]
+        self.assertEqual(len(downloads), 1)
+        self.assertEqual((destination / 'artifacts/output/exports/charts/a.pdf').read_bytes(), b'a')
+        self.assertEqual((destination / 'artifacts/output/exports/charts/b.pdf').read_bytes(), b'b')
+        self.calls.clear()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            cli.pull_selection(self.storage, self.config, self.study, destination=self.root / 'semantic', role='figures')
+        semantic_downloads = [args for args in self.calls if args[0] == 'copy' and str(args[1]).endswith('/packs')]
+        self.assertEqual(len(semantic_downloads), 1)
+        self.assertEqual((self.root / 'semantic/artifacts/output/exports/charts/a.pdf').read_bytes(), b'a')
+        full = self.root / 'packed-full'
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            cli.pull_run(self.storage, self.config, self.study, full)
+        self.assertEqual((full / 'artifacts/output/exports/charts/b.pdf').read_bytes(), b'b')
+        self.assertFalse((full / 'packs').exists())
 
     def test_listing_and_selectors_materialize_only_latest_committed_output(self):
         first, _ = self.snapshot(1, {"exports/charts/old.pdf": b"old"})

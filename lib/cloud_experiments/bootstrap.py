@@ -2,13 +2,12 @@
 
 import base64
 import ast
+import bz2
 import datetime as dt
 import gzip
 import io
 import json
-import lzma
 from pathlib import Path
-import zipfile
 
 from .common import Error
 from .config import ews_discord_webhook
@@ -48,13 +47,19 @@ def render(manifest, secrets, rclone_config):
         files.append(entry)
 
     bundle = io.BytesIO()
-    with zipfile.ZipFile(bundle, "w", zipfile.ZIP_STORED) as z:
-        for name in ("__init__.py", "common.py", "workspace.py", "worker.py", "studies.py", "environment.py", "persistence.py", "ews_contract.py", "synchronization.py", "diagnostics.py"):
-            source = (Path(__file__).parent / name).read_text()
-            # The repository retains explanatory text; the VM receives executable code.
-            z.writestr("cloud_experiments/" + name, ast.unparse(_TransportCode().visit(ast.parse(source))))
-    add("/opt/cloud-experiments/code.zip.xz", lzma.compress(bundle.getvalue(), preset=9), "0644")
-    add("/opt/cloud-experiments/entry.py", "import sys, os, lzma\nfrom pathlib import Path\np=Path('/opt/cloud-experiments/code.zip')\nif not p.exists():\n t=p.with_name('code-'+str(os.getpid())+'.tmp')\n t.write_bytes(lzma.decompress(p.with_suffix('.zip.xz').read_bytes()))\n t.chmod(0o644)\n os.replace(t,p)\nsys.path.insert(0,str(p))\nfrom cloud_experiments.worker import main\nmain()\n", "0644")
+    local_only = {"studies.py": {"digest", "repository_identity", "study_id", "attempt_id", "request_key"},
+                  "ews_contract.py": {"inspect_source"}}
+    for name in ("__init__.py", "common.py", "workspace.py", "worker.py", "studies.py", "environment.py", "persistence.py", "physical.py", "ews_contract.py", "synchronization.py", "diagnostics.py"):
+        source = (Path(__file__).parent / name).read_text()
+        # The repository retains explanatory text; the VM receives executable code.
+        tree = _TransportCode().visit(ast.parse(source))
+        tree.body = [node for node in tree.body if not isinstance(node, ast.FunctionDef)
+                     or node.name not in local_only.get(name, ())]
+        encoded = ast.unparse(tree).encode()
+        bundle.write(name.encode() + b"\n" + len(encoded).to_bytes(4, "big") + encoded)
+    files.append({"path": "/opt/cloud-experiments/code.b85", "content": base64.b85encode(
+        bz2.compress(bundle.getvalue(), compresslevel=9)).decode()})
+    add("/opt/cloud-experiments/entry.py", "import sys, os, bz2, base64, zipfile\nfrom pathlib import Path\np=Path('/opt/cloud-experiments/code.zip')\nif not p.exists():\n b=bz2.decompress(base64.b85decode(p.with_suffix('.b85').read_bytes()))\n t=p.with_name('code-'+str(os.getpid())+'.tmp')\n with zipfile.ZipFile(t,'w') as z:\n  while b:\n   n,b=b.split(b'\\n',1); s=int.from_bytes(b[:4],'big'); z.writestr('cloud_experiments/'+n.decode(),b[4:4+s]); b=b[4+s:]\n t.chmod(0o644)\n os.replace(t,p)\nsys.path.insert(0,str(p))\nfrom cloud_experiments.worker import main\nmain()\n", "0644")
     add("/opt/cloud-experiments/manifest.json", json.dumps(manifest))
     add("/opt/cloud-experiments/credentials.json", json.dumps(secrets))
     add("/opt/cloud-experiments/rclone.conf", rclone_config)

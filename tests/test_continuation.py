@@ -1,9 +1,10 @@
 """Logical studies, environment locks, provider leases and filesystem restore: offline only."""
 
 import contextlib
+import base64
+import bz2
 import io
 import json
-import lzma
 from pathlib import Path
 import shutil
 import signal
@@ -336,8 +337,15 @@ class StateRoundTripTests(unittest.TestCase):
 
     def test_corrupt_restored_bytes_are_rejected_before_execution(self):
         self.persist()
-        source = self.remote/'studies'/self.m['study_id']/'blobs'
-        (source/sha256(self.w.work/'output/runs/run/checkpoints/one/arrays.npz')).write_bytes(b'corrupt')
+        head, _ = persistence.read_head(self.w, self.m)
+        root = remote_path(self.m['storage'], self.m['study_id'])
+        recovery = persistence.read_snapshot(self.call, root, head)
+        layout = persistence.read_layout(self.call, root, head, recovery)
+        digest = sha256(self.w.work/'output/runs/run/checkpoints/one/arrays.npz')
+        pack = next((name for name, members in layout['packs'].items() if digest in members), None)
+        source = self.remote/'studies'/self.m['study_id']
+        target = source/'packs'/(pack + '.tar') if pack else source/'blobs'/digest
+        target.write_bytes(b'corrupt')
         m = study_manifest(self.config, self.m['study_id'])
         w = self.make_worker('bad', m)
         with self.assertRaisesRegex(Error, 'SHA-256'):
@@ -573,13 +581,22 @@ class TimeoutTests(unittest.TestCase):
         data = bootstrap.render(manifest, {'HCLOUD_WORKER_TOKEN': 'fake-token'}, 'fake-rclone')
         self.assertLess(len(data.encode()), 32768)
         files = {f['path']: decode_cloud_file(f) for f in json.loads(data.split('\n',1)[1])['write_files']}
-        with zipfile.ZipFile(io.BytesIO(lzma.decompress(files['/opt/cloud-experiments/code.zip.xz']))) as bundle:
+        code = bz2.decompress(base64.b85decode(files['/opt/cloud-experiments/code.b85']))
+        package_bytes = io.BytesIO()
+        with zipfile.ZipFile(package_bytes, 'w') as package:
+            while code:
+                name, code = code.split(b'\n', 1)
+                size = int.from_bytes(code[:4], 'big')
+                package.writestr('cloud_experiments/' + name.decode(), code[4:4 + size])
+                code = code[4 + size:]
+        with zipfile.ZipFile(io.BytesIO(package_bytes.getvalue())) as bundle:
             for name in bundle.namelist():
                 compile(bundle.read(name), name, 'exec')
             self.assertIn('cloud_experiments/persistence.py', bundle.namelist())
+            self.assertIn('cloud_experiments/physical.py', bundle.namelist())
         with tempfile.TemporaryDirectory() as directory:
             package = Path(directory) / 'worker.zip'
-            package.write_bytes(lzma.decompress(files['/opt/cloud-experiments/code.zip.xz']))
+            package.write_bytes(package_bytes.getvalue())
             result = subprocess.run([sys.executable, '-I', '-c',
                 'import sys; sys.path.insert(0, sys.argv[1]); import cloud_experiments.worker', str(package)],
                 capture_output=True)

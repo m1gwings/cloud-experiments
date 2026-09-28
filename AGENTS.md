@@ -13,6 +13,10 @@ selection, checkpoint validation/fallback, and intentional trajectory pruning.
 - Publish only verified recovery commits. Upload replacement state before pruning,
   keep the preceding usable recovery point on failure, and restore into a new
   output directory. Cloud restores bytes; EWS decides reuse and rematerialization.
+- Keep EWS recovery inventories logical. Cloud physical layouts may reuse loose
+  blobs or immutable packs across commits; read old loose heads without migration.
+  Verify each restored member, publish layouts before commits, and prune a pack
+  only when no retained recovery needs any member. Leave unknown uploads alone.
 - Preserve one writer per lineage, exact EWS pinning, contract compatibility,
   source/config and cloud implementation provenance, credential isolation, and
   bounded finalization/deletion. Small failure metadata must not depend on a large

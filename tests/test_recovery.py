@@ -1,17 +1,20 @@
 """Incremental recovery, VM loss and failure ordering with local fake storage."""
 
 import hashlib
+import gzip
+import io
 import json
 from pathlib import Path
 import shutil
 import subprocess
+import tarfile
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
 from test_core import sample_config
 from test_continuation import env_lock, study_manifest
-from cloud_experiments import ews_contract, persistence, studies, worker
+from cloud_experiments import ews_contract, persistence, physical, studies, worker
 from cloud_experiments.common import Error, read_json, remote_path, sha256, write_json
 
 
@@ -73,7 +76,7 @@ class LocalStorage:
                     target = destination / path.relative_to(source)
                     target.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copyfile(path, target)
-                    if str(args[2]).endswith('/blobs'):
+                    if str(args[2]).endswith(('/blobs', '/packs')):
                         self.uploads.append((path.name, path.stat().st_size))
         elif operation == 'check':
             destination = self.path(args[2])
@@ -101,7 +104,7 @@ class RecoveryTests(unittest.TestCase):
         self.worker = self.new_worker('vm-one', self.manifest)
         self.output = self.worker.work / 'output'
         write_json(self.output / 'metadata.json', {'revision': 1})
-        self.large = b'unchanging retained payload' * 2000
+        self.large = b'unchanging retained payload' * 5000
         (self.output / 'durable.bin').write_bytes(self.large)
         self.create = patch.object(ews_contract, 'create_snapshot', side_effect=lambda w, src, dst, **kwargs: sealed_snapshot(src, dst))
         self.snapshot_api = self.create.start()
@@ -140,13 +143,33 @@ class RecoveryTests(unittest.TestCase):
     def remote_root(self):
         return self.storage.path(remote_path(self.manifest['storage'], self.manifest['study_id']))
 
+    def layout(self, commit):
+        root = remote_path(self.manifest['storage'], self.manifest['study_id'])
+        recovery = persistence.read_snapshot(self.storage, root, commit)
+        return persistence.read_layout(self.storage, root, commit, recovery)
+
+    def loose_legacy_head(self):
+        """Construct a genuine descriptor-free schema 2 head for mixed-lineage tests."""
+        commit = self.sync()
+        root = self.remote_root()
+        recovery = persistence.read_snapshot(self.storage,
+                    remote_path(self.manifest['storage'], self.manifest['study_id']), commit)
+        loose = root / 'blobs'
+        loose.mkdir(exist_ok=True)
+        for name, entry in recovery['files'].items():
+            (loose / entry['sha256']).write_bytes((self.output / name).read_bytes())
+        commit.pop('layout_sha256')
+        write_json(root / 'commits' / (commit['commit_id'] + '.json'), commit)
+        return commit
+
     def test_periodic_sync_transfers_only_new_changed_payloads(self):
         first = self.sync()
         self.assertEqual(len(self.storage.uploads), 2)
         self.storage.uploads.clear()
         write_json(self.output / 'metadata.json', {'revision': 2})
         second = self.sync()
-        self.assertEqual([size for _, size in self.storage.uploads], [(self.output / 'metadata.json').stat().st_size])
+        self.assertEqual(len(self.storage.uploads), 1)
+        self.assertTrue(self.storage.uploads[0][0].endswith('.tar'))
         self.assertEqual(second['parent'], first['commit_id'])
         self.assertNotEqual(second['commit_id'], first['commit_id'])
         root = remote_path(self.manifest['storage'], self.manifest['study_id'])
@@ -155,6 +178,145 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(second['attempt_id'], first['attempt_id'])
         self.assertTrue(any(event[0] == 'check' and '--download' in event for event in self.storage.events))
         self.assertEqual(self.manifest['last_recovery']['commit_id'], second['commit_id'])
+
+    def test_new_layout_packs_small_and_reuses_parent_locations(self):
+        first = self.sync()
+        first_layout = self.layout(first)
+        self.assertEqual(len(first_layout['loose']), 1)
+        self.assertEqual(len(first_layout['packs']), 1)
+        self.assertEqual(first['transfer']['physical_objects_written'], 2)
+        self.storage.uploads.clear()
+        second = self.sync()
+        self.assertEqual(self.storage.uploads, [])
+        self.assertEqual(self.layout(second), first_layout)
+        self.assertEqual(second['transfer']['physical_objects_written'], 0)
+        self.assertEqual(second['request_key'], first['request_key'])
+
+    def test_descriptor_free_legacy_head_restores_and_new_head_mixes_locations(self):
+        first = self.loose_legacy_head()
+        self.assertEqual(self.layout(first)['loose'], physical.inventory(
+            persistence.read_snapshot(self.storage, remote_path(self.manifest['storage'], self.manifest['study_id']), first)).keys())
+        replacement, _ = self.restored()
+        self.assertEqual((replacement.work / 'output/durable.bin').read_bytes(), self.large)
+        (self.output / 'new-small.txt').write_bytes(b'new tiny file')
+        self.storage.uploads.clear()
+        second = self.sync()
+        self.assertEqual(second['parent'], first['commit_id'])
+        layout = self.layout(second)
+        self.assertIn(sha256(self.output / 'durable.bin'), layout['loose'])
+        self.assertIn(sha256(self.output / 'metadata.json'), layout['loose'])
+        self.assertEqual(len(layout['packs']), 1)
+        self.assertEqual(len(self.storage.uploads), 1)
+        self.assertTrue(self.storage.uploads[0][0].endswith('.tar'))
+        restored, _ = self.restored('mixed-replacement')
+        self.assertEqual((restored.work / 'output/new-small.txt').read_bytes(), b'new tiny file')
+
+    def test_interrupted_pack_boundaries_never_advance_head(self):
+        for operation, fragment, stage in [('copy', '/packs', 'recovery.upload'),
+                                           ('check', '/packs', 'recovery.verify'),
+                                           ('copyto', 'layout-', 'recovery.publish_layout')]:
+            with self.subTest(stage=stage):
+                first = self.sync()
+                (self.output / 'new-small.txt').write_bytes(stage.encode())
+                self.storage.fail = lambda args: args[0] == operation and fragment in str(args)
+                with self.assertRaisesRegex(Error, 'interruption'):
+                    self.sync()
+                self.assertEqual(self.worker.current_stage(), stage)
+                self.storage.fail = None
+                self.assertEqual(persistence.read_head(self.worker, self.manifest)[0], first)
+                (self.output / 'new-small.txt').unlink()
+
+    def test_layout_checksum_and_pack_corruption_fail_before_restore(self):
+        commit = self.sync()
+        root = self.remote_root()
+        layout_path = root / 'snapshots' / commit['snapshot_id'] / ('layout-' + commit['commit_id'] + '.json.gz')
+        raw = layout_path.read_bytes()
+        layout_path.write_bytes(b'corrupt')
+        with self.assertRaisesRegex(Error, 'layout checksum'):
+            self.restored()
+        layout_path.write_bytes(raw)
+        pack = next(iter(self.layout(commit)['packs']))
+        pack_path = root / 'packs' / (pack + '.tar')
+        pack_path.write_bytes(b'corrupt')
+        with self.assertRaisesRegex(Error, 'pack failed SHA-256'):
+            self.restored('bad-pack')
+        self.assertFalse((self.root / 'bad-pack/work/output').exists())
+
+    def test_unsupported_layout_and_invalid_commit_reference_fail_closed(self):
+        commit = self.sync()
+        root = remote_path(self.manifest['storage'], self.manifest['study_id'])
+        recovery = persistence.read_snapshot(self.storage, root, commit)
+        layout = {'schema': physical.SCHEMA, 'schema_version': 2,
+                  'snapshot_id': recovery['snapshot_id'], 'loose': [], 'packs': {}}
+        raw = gzip.compress(json.dumps(layout).encode(), mtime=0)
+        path = self.remote_root() / 'snapshots' / commit['snapshot_id'] / ('layout-' + commit['commit_id'] + '.json.gz')
+        path.write_bytes(raw)
+        changed = {**commit, 'layout_sha256': hashlib.sha256(raw).hexdigest()}
+        with self.assertRaisesRegex(Error, 'Unsupported or invalid cloud physical layout'):
+            persistence.read_layout(self.storage, root, changed, recovery)
+        with self.assertRaisesRegex(Error, 'physical layout reference'):
+            studies.state_head(self.manifest['study_id'], [{**commit, 'layout_sha256': None}])
+
+    def test_pack_parser_rejects_bad_member_bytes_and_unsafe_inventory(self):
+        expected = hashlib.sha256(b'right').hexdigest()
+        for names, data, error, link in [([expected], b'wrong', 'SHA-256', False),
+                                         ([expected, expected], b'right', 'duplicate', False),
+                                         (['../escape'], b'right', 'unsafe', False),
+                                         (['other'], b'right', 'unsafe', False),
+                                         ([expected], b'', 'unsafe', True)]:
+            with self.subTest(names=names, link=link):
+                pack = self.root / 'crafted.tar'
+                with tarfile.open(pack, 'w') as archive:
+                    for name in names:
+                        info = tarfile.TarInfo(name)
+                        info.size = len(data)
+                        if link:
+                            info.type = tarfile.SYMTYPE
+                            info.linkname = '../escape'
+                        archive.addfile(info, io.BytesIO(data) if not link else None)
+                destination = self.root / 'extracted'
+                destination.mkdir(exist_ok=True)
+                with self.assertRaisesRegex(Error, error):
+                    physical.extract(pack, sha256(pack), {expected}, {expected}, {expected: 5}, destination)
+                if (destination / expected).exists():
+                    (destination / expected).unlink()
+
+    def test_pack_pruning_keeps_live_members_and_unknown_orphans(self):
+        (self.output / 'small-a').write_bytes(b'A')
+        (self.output / 'small-b').write_bytes(b'B')
+        first = self.sync()
+        old_pack = next(iter(self.layout(first)['packs']))
+        root = self.remote_root()
+        orphan_pack = root / 'packs' / ('f' * 64 + '.tar')
+        orphan_pack.write_bytes(b'orphan')
+        orphan_blob = root / 'blobs' / ('e' * 64)
+        orphan_blob.write_bytes(b'orphan')
+        (self.output / 'small-a').unlink()
+        write_json(self.output / 'metadata.json', {'revision': 2})
+        self.sync()
+        write_json(self.output / 'metadata.json', {'revision': 3})
+        self.sync()
+        self.assertTrue((root / 'packs' / (old_pack + '.tar')).exists())
+        (self.output / 'small-b').unlink()
+        write_json(self.output / 'metadata.json', {'revision': 4})
+        self.sync()
+        self.sync()
+        self.assertFalse((root / 'packs' / (old_pack + '.tar')).exists())
+        self.assertTrue(orphan_pack.exists())
+        self.assertTrue(orphan_blob.exists())
+
+    def test_thousands_of_tiny_files_need_few_remote_payload_objects(self):
+        directory = self.output / 'many'
+        directory.mkdir()
+        for index in range(3000):
+            (directory / f'{index:04}.bin').write_bytes(f'{index:04} payload'.encode() * 20)
+        commit = self.sync()
+        stats = commit['transfer']
+        self.assertGreaterEqual(stats['logical_files'], 3002)
+        self.assertEqual(stats['physical_objects_written'], 2)
+        self.assertEqual(stats['packs'], 1)
+        self.assertGreater(stats['unique_digests'] / stats['physical_objects_written'], 100)
+        self.assertEqual(len(list((self.remote_root() / 'packs').iterdir())), stats['packs'])
 
     def test_recovery_timestamp_describes_publication_after_transfer(self):
         with patch('cloud_experiments.persistence.utcnow', side_effect=['preparing', 'durable']):
@@ -168,7 +330,7 @@ class RecoveryTests(unittest.TestCase):
         self.storage.fail = lambda args: args[0] == 'check'
         with self.assertRaisesRegex(Error, 'interruption'):
             self.sync()
-        self.assertEqual(self.worker.current_stage(), 'recovery.verify_blobs')
+        self.assertEqual(self.worker.current_stage(), 'recovery.verify')
         self.storage.fail = None
         head, _ = persistence.read_head(self.worker, self.manifest)
         self.assertEqual(head, first)

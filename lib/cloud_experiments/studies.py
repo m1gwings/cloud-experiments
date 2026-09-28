@@ -87,6 +87,9 @@ def state_head(study, commits, *, allow_legacy=False):
                     or type(commit.get("completed")) is not bool):
                 raise Error("Invalid cloud recovery commit metadata.")
             validate_contract(commit.get("contract"))
+            if "layout_sha256" in commit and (not isinstance(commit["layout_sha256"], str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", commit["layout_sha256"])):
+                raise Error("Invalid cloud physical layout reference.")
             provenance = commit.get("provenance")
             if not isinstance(provenance, dict):
                 raise Error("Recovery commit is missing tooling provenance.")

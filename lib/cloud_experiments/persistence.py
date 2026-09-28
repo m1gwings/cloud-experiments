@@ -21,7 +21,7 @@ from .common import Error, read_json, remote_path, sha256, utcnow, valid_result_
 from .environment import validate, verify
 from .workspace import secret_path
 from .studies import attempt_study, state_head
-from . import ews_contract
+from . import ews_contract, physical
 
 
 def _read_history(call, root, study):
@@ -80,7 +80,22 @@ def read_snapshot(call, root, commit):
     return recovery
 
 
-def download_files(call, root, recovery, destination, paths):
+def read_layout(call, root, commit, recovery):
+    """A missing descriptor denotes the original loose-blob schema 2 layout."""
+    if "layout_sha256" not in commit:
+        return physical.legacy(recovery)
+    checksum = commit["layout_sha256"]
+    if not isinstance(checksum, str) or not re.fullmatch(r"[0-9a-f]{64}", checksum):
+        raise Error("Invalid cloud physical layout checksum reference.")
+    remote = root + "/snapshots/" + commit["snapshot_id"] + "/layout-" + commit["commit_id"] + ".json.gz"
+    raw = call("cat", remote, timeout=60).stdout
+    raw = raw.encode() if isinstance(raw, str) else raw
+    if hashlib.sha256(raw).hexdigest() != checksum:
+        raise Error("Cloud physical layout checksum mismatch.")
+    return physical.decode(raw, recovery)
+
+
+def download_files(call, root, recovery, destination, paths, layout=None, *, pack_cache=None, remember_pack=False):
     """Batch-fetch exact blobs, verify all bytes, then materialize selected output."""
     destination = Path(destination)
     paths = list(paths)
@@ -100,20 +115,50 @@ def download_files(call, root, recovery, destination, paths):
             if parent.is_symlink():
                 raise Error("Recovery destination contains a symlink.")
     destination.mkdir(parents=True, exist_ok=True)
+    layout = layout if layout is not None else physical.legacy(recovery)
+    locations = physical.locations(layout)
+    if not set(digests) <= locations.keys():
+        raise Error("Cloud physical layout does not cover selected recovery files.")
     with tempfile.TemporaryDirectory(prefix=".download-", dir=destination) as temporary:
         temporary = Path(temporary)
-        selection = temporary / "blobs.txt"
-        selection.write_text("".join(digest + "\n" for digest in sorted(digests)))
         pool = temporary / "blobs"
+        pool.mkdir()
+        loose = {digest for digest in digests if locations[digest] is None}
+        selection = temporary / "blobs.txt"
+        selection.write_text("".join(digest + "\n" for digest in sorted(loose)))
         # Direct lookups are faster for a few selected results; large recovery
         # inventories are faster when the blob pool is listed and filtered once.
-        listing = ["--no-traverse"] if len(digests) <= 256 else ["--fast-list"]
-        call("copy", root + "/blobs", str(pool), "--files-from", str(selection),
-             *listing, "--transfers", "16", timeout=7200)
-        for digest, size in digests.items():
+        listing = ["--no-traverse"] if len(loose) <= 256 else ["--fast-list"]
+        if loose:
+            call("copy", root + "/blobs", str(pool), "--files-from", str(selection),
+                 *listing, "--transfers", "16", timeout=7200)
+        for digest in loose:
+            size = digests[digest]
             blob = pool / digest
             if blob.is_symlink() or not blob.is_file() or blob.stat().st_size != size or sha256(blob) != digest:
                 raise Error("Restored EWS state failed SHA-256 verification; no experiment was started.")
+        needed_packs = {locations[digest] for digest in digests if locations[digest] is not None}
+        if needed_packs:
+            packs = temporary / "packs"
+            packs.mkdir()
+            cached = needed_packs & (pack_cache.keys() if pack_cache is not None else set())
+            for pack in cached:
+                (packs / (pack + ".tar")).write_bytes(pack_cache[pack])
+            missing = needed_packs - cached
+            pack_selection = temporary / "packs.txt"
+            pack_selection.write_text("".join(digest + ".tar\n" for digest in sorted(missing)))
+            if missing:
+                call("copy", root + "/packs", str(packs), "--files-from", str(pack_selection),
+                     "--no-traverse", "--transfers", "16", timeout=7200)
+            for pack in sorted(needed_packs):
+                required = {digest for digest in digests if locations[digest] == pack}
+                physical.extract(packs / (pack + ".tar"), pack, layout["packs"][pack], required, digests, pool)
+            if remember_pack and pack_cache is not None and len(needed_packs) == 1:
+                pack = next(iter(needed_packs))
+                path = packs / (pack + ".tar")
+                if path.stat().st_size <= 16 * 1024 * 1024:
+                    pack_cache.clear()
+                    pack_cache[pack] = path.read_bytes()
         for name in paths:
             target = destination / name
             for parent in (target, *target.parents):
@@ -132,12 +177,13 @@ def download_snapshot(call, root, commit, directory):
     if directory.exists():
         raise Error("Recovery download destination must not exist.")
     recovery = read_snapshot(call, root, commit)
+    layout = read_layout(call, root, commit, recovery)
     directory.mkdir(parents=True)
     output = directory / "output"
     output.mkdir()
     for name in recovery["directories"]:
         (output / name).mkdir(parents=True, exist_ok=True)
-    download_files(call, root, recovery, output, recovery["files"])
+    download_files(call, root, recovery, output, recovery["files"], layout)
     write_json(directory / "recovery.json", recovery, mode=0o644)
     return recovery
 
@@ -235,10 +281,6 @@ def _commit(manifest, recovery, recovery_sha256, parent, final):
                            "config": manifest["config"]}}
 
 
-def _digests(recovery):
-    return {descriptor["sha256"] for descriptor in recovery["files"].values()}
-
-
 def _prune(call, root, commits, head, retained):
     """Delete only superseded committed content, retaining the current recovery.
 
@@ -253,12 +295,19 @@ def _prune(call, root, commits, head, retained):
                         if head and commit["commit_id"] == head.get("parent")), None)
     if predecessor is None:
         return
-    obsolete = _digests(read_snapshot(call, root, predecessor)) - retained
+    old_recovery = read_snapshot(call, root, predecessor)
+    old_layout = read_layout(call, root, predecessor, old_recovery)
+    obsolete = old_layout["loose"] - retained["loose"]
     for digest in sorted(obsolete):
         blob = root + "/blobs/" + digest
         entry = json.loads(call("lsjson", blob, "--stat", timeout=30).stdout)
         if not entry.get("IsDir") and entry.get("Path") == digest:
             call("deletefile", blob, timeout=60)
+    for pack in sorted(old_layout["packs"].keys() - retained["packs"].keys()):
+        remote = root + "/packs/" + pack + ".tar"
+        entry = json.loads(call("lsjson", remote, "--stat", timeout=30).stdout)
+        if not entry.get("IsDir") and entry.get("Path") == pack + ".tar":
+            call("deletefile", remote, timeout=60)
 
 
 def sync(worker, manifest, snapshot=None, final=False):
@@ -289,39 +338,92 @@ def sync(worker, manifest, snapshot=None, final=False):
         if recovered and head["snapshot_id"] == recovery["snapshot_id"] and head["final"] == final:
             return head
         previous = read_snapshot(call, root, head) if head else None
-        previous_digests = _digests(previous) if previous else set()
-        candidate_digests = _digests(recovery)
+        previous_layout = read_layout(call, root, head, previous) if head else {"loose": set(), "packs": {}}
+        previous_locations = physical.locations(previous_layout)
+        sizes = physical.inventory(recovery)
+        candidate_digests = set(sizes)
         commit = _commit(manifest, recovery, sha256(snapshot / "recovery.json"), current, final)
-        manifest["pending_recovery"] = commit
-        worker.save(manifest)
+        # The parent descriptor gives reusable locations without remote probes.
+        layout = {"loose": candidate_digests & previous_layout["loose"],
+                  "packs": {pack: set(members) for pack, members in previous_layout["packs"].items()
+                            if set(members) & candidate_digests}}
+        sources = {}
+        for name, descriptor in recovery["files"].items():
+            digest = descriptor["sha256"]
+            if digest not in previous_locations and digest not in sources:
+                sources[digest] = (snapshot / "output" / name, descriptor["size"])
+        new_loose = {digest: source for digest, source in sources.items() if source[1] >= physical.SMALL_LIMIT}
+        small = {digest: source for digest, source in sources.items() if source[1] < physical.SMALL_LIMIT}
+        layout["loose"].update(new_loose)
         # Hardlinks reference the immutable sealed snapshot, not the live output.
-        # rclone verifies downloaded bytes; S3 ETags need not be content checksums.
+        # rclone checks remote bytes by downloading; S3 ETags are not checksums.
         with tempfile.TemporaryDirectory(prefix="sync-", dir=snapshot.parent) as temporary:
             transfer = Path(temporary)
-            for name, descriptor in recovery["files"].items():
-                digest = descriptor["sha256"]
-                target = transfer / digest
-                if digest not in previous_digests and not target.exists():
-                    source = snapshot / "output" / name
-                    if source.is_symlink() or source.stat().st_size != descriptor["size"] or sha256(source) != digest:
-                        raise Error("Sealed recovery payload changed before synchronization.")
-                    os.link(source, target)
-            if any(transfer.iterdir()):
-                worker.stage(component, "recovery.upload_blobs")
-                call("copy", str(transfer), root + "/blobs", "--ignore-times", timeout=1800)
-                worker.stage(component, "recovery.verify_blobs")
-                call("check", str(transfer), root + "/blobs", "--one-way", "--download", timeout=1800)
+            loose_dir = transfer / "blobs"
+            pack_dir = transfer / "packs"
+            loose_dir.mkdir()
+            pack_dir.mkdir()
+            worker.stage(component, "recovery.build_packs")
+            for digest, (source, size) in new_loose.items():
+                if not stat.S_ISREG(source.lstat().st_mode) or source.stat().st_size != size or sha256(source) != digest:
+                    raise Error("Sealed recovery payload changed before synchronization.")
+                os.link(source, loose_dir / digest)
+            batch, batch_size = {}, 0
+            def flush_pack():
+                nonlocal batch, batch_size
+                if not batch:
+                    return
+                temporary_pack = transfer / "building.tar"
+                digest = physical.pack_sources(batch, temporary_pack)
+                target = pack_dir / (digest + ".tar")
+                if target.exists():
+                    temporary_pack.unlink()
+                else:
+                    temporary_pack.rename(target)
+                layout["packs"].setdefault(digest, set()).update(batch)
+                batch, batch_size = {}, 0
+            for digest, source in sorted(small.items()):
+                estimate = 512 + ((source[1] + 511) // 512) * 512
+                if batch and batch_size + estimate > physical.PACK_TARGET:
+                    flush_pack()
+                batch[digest] = source
+                batch_size += estimate
+            flush_pack()
+            layout_bytes = physical.encode(recovery["snapshot_id"], layout)
+            physical.decode(layout_bytes, recovery)
+            commit["layout_sha256"] = hashlib.sha256(layout_bytes).hexdigest()
+            commit["transfer"] = {"logical_files": len(recovery["files"]), "unique_digests": len(sizes),
+                                  "logical_bytes": sum(entry["size"] for entry in recovery["files"].values()),
+                                  "standalone_objects": len(layout["loose"]),
+                                  "packed_members": sum(len(members & candidate_digests) for members in layout["packs"].values()),
+                                  "packs": len(layout["packs"]),
+                                  "physical_objects_written": len(new_loose) + len(list(pack_dir.iterdir()))}
+            manifest["pending_recovery"] = commit
+            worker.save(manifest)
+            worker.stage(component, "recovery.upload")
+            for local, remote in ((loose_dir, root + "/blobs"), (pack_dir, root + "/packs")):
+                if any(local.iterdir()):
+                    call("copy", str(local), remote, "--ignore-times", timeout=1800)
+                    worker.stage(component, "recovery.verify")
+                    call("check", str(local), remote, "--one-way", "--download", timeout=1800)
         # The EWS marker is published only after all of its payload is verified.
         worker.stage(component, "recovery.publish_snapshot")
         marker = root + "/snapshots/" + recovery["snapshot_id"] + "/recovery.json"
         call("copyto", str(snapshot / "recovery.json"), marker, timeout=45)
         read_snapshot(call, root, commit)
+        worker.stage(component, "recovery.publish_layout")
+        local_layout = worker.base / "recovery-layout.json.gz"
+        local_layout.write_bytes(layout_bytes)
+        call("copyto", str(local_layout), root + "/snapshots/" + recovery["snapshot_id"] + "/layout-" + commit["commit_id"] + ".json.gz", timeout=45)
+        read_layout(call, root, commit, recovery)
         # Recheck ownership and parent immediately before destructive/publication effects.
         worker.verify_lease(manifest)
         latest, _ = read_head(worker, manifest, call=call)
         if (latest["commit_id"] if latest else None) != current:
             raise Error("Study recovery parent changed during synchronization; refusing publication.")
-        _prune(call, root, commits, head, previous_digests | candidate_digests)
+        retained = {"loose": previous_layout["loose"] | layout["loose"],
+                    "packs": {**previous_layout["packs"], **layout["packs"]}}
+        _prune(call, root, commits, head, retained)
         commit["committed_at"] = utcnow()
         worker.save(manifest)  # Persist the exact pending marker before its remote write.
         path = worker.base / "recovery-commit.json"

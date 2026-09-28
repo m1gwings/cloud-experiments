@@ -178,7 +178,7 @@ bucket = "migwings-experiments"
 
 [ews]
 repository = "https://github.com/m1gwings/experiments-wo-stress.git"
-default_ref = "67c3d1b729a697ae0e104e3e81c3b93e73917d09"
+default_ref = "d1bbe748f590d89cbdf9df6513a854c58108a554"
 
 [run]
 sync_seconds = 300
@@ -186,7 +186,8 @@ sync_seconds = 300
 ```
 
 Keep an explicit EWS commit in `default_ref`, or supply it with `--ews-ref`.
-The revision above exposes the supported EWS recovery contract version 1.
+The revision above exposes recovery contract version 1 and omits checkpoint
+payloads for valid intentionally pruned trajectories from its sealed snapshot.
 The launcher checks the selected revision's contract before creating a VM, then
 the worker queries the installed public API again. The EWS commit records source
 provenance; its recovery contract version determines persistence compatibility.
@@ -199,6 +200,10 @@ checkpoint, seals the safe output through EWS, then resumes the sole invocation.
 Upload runs while compute continues and transfers only new content. A long
 protocol step, snapshot sealing, or unavailable storage can extend the time
 since the last durable recovery point. Check that time in `cloud-status`.
+Cloud storage packs newly needed small recovery payloads automatically; there is
+no study setting or migration step. Existing loose recoveries remain readable.
+Selective result pulls can transfer a whole pack for one small file. A failed
+packing or layout-publication stage appears in the usual `cloud-diagnose` record.
 
 `timezone` is an optional display override passed as EWS's `--timezone`.
 EWS validates the installed IANA name on the VM; omitted values preserve the

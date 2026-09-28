@@ -35,6 +35,8 @@ default_ref = "main"
 
 def decode_cloud_file(entry):
     """Decode the cloud-init write_files encoding actually supplied by bootstrap."""
+    if "encoding" not in entry:
+        return entry["content"].encode()
     content = base64.b64decode(entry['content'])
     return gzip.decompress(content) if entry['encoding'] == 'gz+b64' else content
 

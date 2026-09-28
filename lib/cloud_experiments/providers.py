@@ -105,6 +105,7 @@ class Storage:
         self.config_file = config["local"]["rclone_config"]
         self._recovery_views = {}
         self._histories = {}
+        self._pack_cache = {}
 
     def call(self, *args, timeout=1800):
         label = {"cat": "Reading stored manifest", "lsjson": "Listing stored files",
@@ -213,12 +214,23 @@ class Storage:
             entry = view["recovery"]["files"].get(name)
             if entry is None or not view["available"]:
                 raise Error("The selected recovery artifact is unavailable; use the current study snapshot.")
-            remote = view["root"] + "/blobs/" + entry["sha256"]
+            from .persistence import download_files
+            from .physical import locations
+            layout = view["layout"]
+            if locations(layout)[entry["sha256"]] is not None:
+                with tempfile.TemporaryDirectory(prefix="cloud-artifact-index-") as temporary:
+                    download_files(self.call, view["root"], view["recovery"], temporary, [name], layout,
+                                   pack_cache=self._pack_cache, remember_pack=True)
+                    raw = (Path(temporary) / name).read_bytes()
+                remote = None
+            else:
+                remote = view["root"] + "/blobs/" + entry["sha256"]
         else:
             entry = None
             remote = self.path(rid) + "/" + path
-        raw = self.call("cat", remote,
-                        "--head", str(MAX_INDEX_BYTES + 1), timeout=90).stdout
+        if remote is not None:
+            raw = self.call("cat", remote,
+                            "--head", str(MAX_INDEX_BYTES + 1), timeout=90).stdout
         size = len(raw.encode("utf-8")) if isinstance(raw, str) else len(raw)
         if size > MAX_INDEX_BYTES:
             raise Error("EWS artifact catalog exceeds the 64 KiB limit; use --path.")
@@ -320,7 +332,7 @@ class Storage:
             import shutil
             files = self._raw_files(rid)
             self.pull_paths(rid, destination, [entry["path"] for entry in files
-                                             if not entry["path"].startswith(("blobs/", "snapshots/", "artifacts/output/"))])
+                                             if not entry["path"].startswith(("blobs/", "packs/", "snapshots/", "artifacts/output/"))])
             if view["available"]:
                 artifacts = destination / "artifacts"
                 artifacts.mkdir(parents=True, exist_ok=True)
@@ -378,7 +390,7 @@ class Storage:
             return self._recovery_views[rid]
         files, commits, head = self._study_history(study)
         root = self.path(study)
-        if not head and any(entry["path"].startswith(("blobs/", "snapshots/")) for entry in files):
+        if not head and any(entry["path"].startswith(("blobs/", "packs/", "snapshots/")) for entry in files):
             view = {"root": root, "head": None, "recovery": {"files": {}}, "available": False}
             self._recovery_views[rid] = view
             return view
@@ -395,17 +407,21 @@ class Storage:
                 view = {"root": root, "head": None, "recovery": {"files": {}}, "available": False}
                 self._recovery_views[rid] = view
                 return view
-        from .persistence import read_snapshot
+        from .persistence import read_snapshot, read_layout
+        from .physical import locations
         recovery = read_snapshot(self.call, root, head)
-        available_blobs = {entry["path"].removeprefix("blobs/"): entry["size"]
-                           for entry in files if entry["path"].startswith("blobs/")}
-        available = all(available_blobs.get(entry["sha256"]) == entry["size"] for entry in recovery["files"].values())
+        layout = read_layout(self.call, root, head, recovery)
+        physical_locations = locations(layout)
+        stored = {entry["path"]: entry["size"] for entry in files}
+        available = all((stored.get("blobs/" + digest) == entry["size"] if physical_locations[digest] is None
+                         else "packs/" + physical_locations[digest] + ".tar" in stored)
+                        for entry in recovery["files"].values() for digest in (entry["sha256"],))
         if not available:
             if rid == study:
                 raise Error("The committed recovery snapshot is incomplete; refusing to expose partial output.")
             print("Warning: this attempt's recovery output was superseded; its source and logs remain available. "
                   "Pull the study ID for current recovery output.", file=sys.stderr)
-        view = {"root": root, "head": head, "recovery": recovery, "available": available}
+        view = {"root": root, "head": head, "recovery": recovery, "layout": layout, "available": available}
         self._recovery_views[rid] = view
         return view
 
@@ -414,7 +430,7 @@ class Storage:
         view = self._recovery_view(rid)
         if view is None:
             return files
-        files = [entry for entry in files if not entry["path"].startswith(("blobs/", "snapshots/", "artifacts/output/"))]
+        files = [entry for entry in files if not entry["path"].startswith(("blobs/", "packs/", "snapshots/", "artifacts/output/"))]
         if view["available"]:
             files.extend({"path": "artifacts/output/" + name, "size": entry["size"]}
                          for name, entry in view["recovery"]["files"].items())
@@ -446,7 +462,8 @@ class Storage:
                     raise Error("This attempt's recovery output was superseded; use the study ID for current output.")
                 from .persistence import download_files
                 with Activity("Downloading and verifying selected recovery files"):
-                    download_files(self.call, view["root"], view["recovery"], destination / "artifacts/output", selected)
+                    download_files(self.call, view["root"], view["recovery"], destination / "artifacts/output", selected,
+                                   view["layout"], pack_cache=self._pack_cache)
             paths = [path for path in paths if not path.startswith("artifacts/output/")]
             if not paths:
                 return

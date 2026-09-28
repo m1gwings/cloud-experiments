@@ -220,6 +220,10 @@ Legacy `runs/RUN_ID/` remains readable without migration.
 Every attempt archives immutable inputs, logs, environment and runtime provenance,
 plus other generated workspace artifacts. EWS output is stored as shared verified
 recovery objects; downloads materialize its normal tree under `artifacts/output`.
+EWS keeps fine-grained local files. Cloud storage packs newly needed files below
+64 KiB into immutable objects near 8 MiB and keeps larger content standalone.
+Existing loose-blob studies remain readable and move to mixed storage naturally
+on later commits; no old snapshots are repacked before continuation.
 This avoids duplicating a many-GB output for every sync or attempt. Full study
 pulls retain attempt inputs/logs and the latest committed output. Historical
 recovery metadata remains, but intentionally pruned old output is not a permanent
@@ -243,10 +247,11 @@ recovery and never postpones deletion indefinitely. See
 
 EWS intentionally pruned trajectories are eventually removed remotely only after
 replacement state is verified, while preserving the preceding recovery point.
-Recovery history reads only commit and environment records; pruning checks each
-obsolete blob directly, so neither step lists the whole growing result pool.
-Continuation fetches the sealed blob inventory in one bounded parallel transfer,
-then checks every size and SHA-256 before starting EWS.
+Recovery history reads only commit and environment records. Cloud prunes a pack
+only after no retained recovery references any of its members; unknown uploads
+are left alone. Restore resolves the committed physical layout, downloads each
+needed pack once, and checks every logical file's size and SHA-256 before EWS
+starts. A selective tiny-file download may fetch its whole modest pack.
 Other artifact collection captures new/modified regular files under `/work`,
 compared with the initial source snapshot. Dependency/control/secret-like paths
 and configured `artifact_exclude` globs are excluded; links are never followed.
