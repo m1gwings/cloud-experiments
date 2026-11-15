@@ -111,7 +111,7 @@ def load(path=None):
         data["run"] = run_settings(data.get("run", {}))
         local = data.setdefault("local", {})
         local["state_dir"] = str(Path(local.get("state_dir", Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "cloud-experiments")).expanduser().absolute())
-        local["results_dir"] = str(Path(local.get("results_dir", Path.home() / "cloud-results")).expanduser().absolute())
+        local["results_dir"] = str(Path(local.get("results_dir", Path.home() / "Downloads" / "cloud_results")).expanduser().absolute())
         local["worker_env"] = str(Path(local.get("worker_env", config_home() / "worker.env")).expanduser().absolute())
         local["rclone_config"] = str(Path(local.get("rclone_config", Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "rclone/rclone.conf")).expanduser().absolute())
         if local.get("ssh_identity"):

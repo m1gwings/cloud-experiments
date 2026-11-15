@@ -27,7 +27,7 @@ sync_seconds = 300 # request a safe recovery boundary every five minutes
 # All paths support ~. XDG_CONFIG_HOME and XDG_STATE_HOME are honored by defaults.
 # [local]
 # state_dir = "~/.local/state/cloud-experiments"
-# results_dir = "~/cloud-results"
+# results_dir = "~/Downloads/cloud_results"
 # worker_env = "~/.config/cloud-experiments/worker.env"
 # rclone_config = "~/.config/rclone/rclone.conf"
 # ssh_identity = "~/.ssh/id_ed25519"

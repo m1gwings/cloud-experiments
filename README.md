@@ -42,7 +42,7 @@ project, `nbg1`, and `migwings-experiments` bucket described there.
 | `cloud-diagnose RUN_ID [--journal]` | Read the latest failure capsule; `--list` shows event IDs and `--event ID` selects an older event. |
 | `cloud-results list` | Show stored studies with current VM presence and separate persistence outcomes. |
 | `cloud-results ls RUN_ID [--json]` | Recursively list remote file paths and sizes without downloading contents. |
-| `cloud-results pull RUN_ID [--dest PATH]` | Download study inputs/history/current output, an attempt, or a legacy run, by default to `~/cloud-results/RUN_ID`. |
+| `cloud-results pull RUN_ID [--dest PATH]` | Download study inputs/history/current output, an attempt, or a legacy run, by default to `~/Downloads/cloud_results/RUN_ID`. |
 | `cloud-results pull RUN_ID --plots` | Resolve the EWS `figures` role; succeed with an explanation if optional files are absent. |
 | `cloud-results pull RUN_ID --analysis` | Resolve the EWS `analysis` role; does not execute analysis. |
 | `cloud-results pull RUN_ID --report` | Resolve the EWS `compute_report` role. |
@@ -339,14 +339,14 @@ example, for an **attempt ID** with the current default EWS layout (examples, no
 mappings; a study ID adds `attempts/ATTEMPT_ID/` before these artifact paths):
 
 ```text
---plots                         -> ~/cloud-results/RUN_ID/artifacts/output/analysis/figures/
---analysis                      -> ~/cloud-results/RUN_ID/artifacts/output/analysis/
---report                        -> ~/cloud-results/RUN_ID/artifacts/output/compute/summary.md
---path logs                     -> ~/cloud-results/RUN_ID/logs/
---path manifest.json            -> ~/cloud-results/RUN_ID/manifest.json
+--plots                         -> ~/Downloads/cloud_results/RUN_ID/artifacts/output/analysis/figures/
+--analysis                      -> ~/Downloads/cloud_results/RUN_ID/artifacts/output/analysis/
+--report                        -> ~/Downloads/cloud_results/RUN_ID/artifacts/output/compute/summary.md
+--path logs                     -> ~/Downloads/cloud_results/RUN_ID/logs/
+--path manifest.json            -> ~/Downloads/cloud_results/RUN_ID/manifest.json
 ```
 
-The configured `local.results_dir` replaces `~/cloud-results`. `--dest` sets the
+The configured `local.results_dir` replaces `~/Downloads/cloud_results`. `--dest` sets the
 local **run root**, including for selective pulls:
 
 ```bash

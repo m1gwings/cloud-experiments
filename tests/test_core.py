@@ -80,6 +80,15 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaises(Error):
                 config.repository_url(value)
 
+    def test_results_destination_default_and_override(self):
+        path = self.root / "config.toml"
+        with patch("cloud_experiments.config.Path.home", return_value=self.root):
+            loaded = config.load(path)
+            self.assertEqual(loaded["local"]["results_dir"], str(self.root / "Downloads/cloud_results"))
+            path.write_text(CONFIG + f'\n[local]\nresults_dir = "{self.root}/custom_results"\n')
+            loaded = config.load(path)
+            self.assertEqual(loaded["local"]["results_dir"], str(self.root / "custom_results"))
+
     def test_credentials_are_narrowly_selected_not_shell_executed(self):
         path = self.root / "worker.env"
         path.write_text('# Fake test-only values\nexport HCLOUD_WORKER_TOKEN="fake-token"\nUNRELATED=never-copy\n')

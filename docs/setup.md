@@ -254,13 +254,21 @@ Optional paths and execution settings are documented in the example. Defaults:
 config      ~/.config/cloud-experiments/config.toml
 secrets     ~/.config/cloud-experiments/worker.env
 state       ~/.local/state/cloud-experiments/RUN_ID/
-results     ~/cloud-results/RUN_ID/
+results     ~/Downloads/cloud_results/RUN_ID/
 ```
 
 XDG configuration/state environment variables are honored. State holds source
 snapshots, non-secret manifests, and per-server known-host files. Do not configure
 it inside experiment repositories. Results and state are not automatically
 pruned; delete local copies deliberately after confirming remote persistence.
+
+Results are downloaded copies, kept under `Downloads/cloud_results` by default;
+they are separate from the tool checkout and internal state. To retain downloads
+from the former `~/cloud-results` default, move that folder to
+`~/Downloads/cloud_results` before the next pull or sync (with no existing folder
+at the destination). Existing full-download markers move with it. If your config
+explicitly sets `local.results_dir`, update that value too; explicit destinations
+continue to override the default.
 
 ## 8. Install and validate without creating compute
 
